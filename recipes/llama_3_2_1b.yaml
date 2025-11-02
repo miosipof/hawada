@@ -1,0 +1,109 @@
+# LLaMA 3.2 1B (HF) — pruning + KD fine-tuning recipe
+# Save as: recipes/llama_3_2_1b.yaml
+
+model:
+  hf_id: meta-llama/Llama-3.2-1B
+  adapter: huggingface.llama  # LlamaAdapter
+
+gating:
+  tau: 1.5
+  init_logit: 3.0
+  head_gating: true
+  gate_kv: false            # keep KV ungated (proxy assumes Q-only)
+  ffn_group: 128            # SwiGLU group size
+  ffn_gating: true
+  hard_eval: true
+
+data:
+  # Streaming/packed SlimPajama test shards as used in your code
+  dataset_name: fla-hub/slimpajama-test
+  tokenizer_name: meta-llama/Llama-3.2-1B
+  seq_len: 1024
+  train:
+    batch_size: 1
+    num_workers: 4
+    streaming: false
+    size: 3000
+    shuffle_buffer: 20000
+    seed: 1234
+  val:
+    batch_size: 1
+    num_workers: 4
+    streaming: false
+    size: 300
+    shuffle_buffer: 20000
+    seed: 1234
+
+train:
+  device: cuda
+  epochs: 10
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  amp_dtype: bf16
+  use_cosine: false
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+  optimizer: adafactor
+  lrs:
+    lr: 5.0e-5         # main LR for fine-tune
+    gate_lr: 5.0e-2    # for gate-only phase (search/attach loop)
+    weight_lr: 1.0e-4  # for 2-pass gate training (if used)
+  kd:
+    T: 4.0
+    alpha: 0.9         # weight of KD term
+    ce_weight: 0.1     # small CE on teacher argmax for stability
+    decode_kd_steps: 0 # set >0 to add lightweight decode KD
+  logging:
+    log_every: 100
+
+latency_proxy:
+  type: LLM            # LatencyProxyLLM
+  gate_kv_in_proxy: false
+  # Initial weights; you’ll calibrate scale_ms automatically
+  scale_ms: 1.0
+  alpha_qkv: 1.0
+  alpha_scores: 1.0
+  alpha_out: 1.0
+  alpha_mlp: 1.0
+  measure:
+    B: 1
+    S: 1024
+    T: 128
+
+gate_training:          # optional 2-pass “optimize for latency” stage
+  tau_target_ms: 0.85   # latency budget for proxy constraint (example)
+  step_warmup_for_proxy: 5
+  real_latency_every: 20
+  export_eval_policy:
+    warmup_steps: 0
+    q_head_floor_post: 4
+    q_head_multiple_post: 8
+    ffn_min_keep_ratio_post: 0.80
+    ffn_snap_groups_post: 32
+
+export:
+  # Adapter uses LlamaExportPolicy with separate rounding for heads/FFN
+  warmup_steps: 200
+  heads:
+    rounding:
+      # Keep >= 8 heads and snap to multiple of 8.
+      # Adapter then LCM-snaps with Hkv (GQA) to remain valid.
+      floor: 8
+      multiple: 8
+  ffn:
+    rounding:
+      min_keep_ratio: 0.80
+      multiple: 32
+
+search:
+  # Grid for post-export latency search (uses grid_search_latency)
+  head_multiples: [1, 2, 4, 8]
+  ffn_snaps: [1, 32, 64, 128]
+  # Batch shape interpreted by the LLaMA adapter runner as (B,S)
+  batch_shape: [1, 1024]
+  device: cuda
+
+outputs:
+  run_dir: runs/llama_3_2_1b/
+  slim_path: runs/llama_3_2_1b/slim.pth
+  export_log: runs/llama_3_2_1b/export.log
