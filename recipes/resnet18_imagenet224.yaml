@@ -1,0 +1,46 @@
+# Minimal recipe for ResNet-18 hardware-aware optimization on ImageNet-like data
+
+model:
+  name: resnet18
+  pretrained: true
+  num_classes: 1000
+
+# BN gating config
+gates:
+  group_size: 16
+  tau: 1.5
+  init_logit: 3.0
+  hard_eval: true
+
+# Training (gates + weights) with latency constraint
+trainer:
+  amp: true
+  use_grad_scaler: true
+  kd:
+    temperature: 2.0
+    alpha: 0.5
+  lagrange:
+    real_every: 10         # measure real latency every N steps (export-eval policy)
+    lr_gate: 5.0e-3        # mirrors param groups defaults
+    lr_weight: 1.0e-4
+    min_keep_ratio: 0.25   # floor during training/export
+    sparsity_reg: 1.0e-4
+    tau_target_scale: 0.7  # target = 0.7 * keep-all latency
+
+# Data
+data:
+  train_root: /data/imagenet100-224/train
+  val_root: /data/imagenet100-224/val
+  batch_size: 64
+  num_workers: 8
+  img_size: 224
+
+# Export search grid (kernel-aware)
+export:
+  warmup_steps: 0
+  grid_multiple_groups: [4, 5, 8, 16]
+
+# Fine-tuning after export
+finetune:
+  epochs: 10
+  lr: 3.0e-4

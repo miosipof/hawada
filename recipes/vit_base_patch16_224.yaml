@@ -1,0 +1,74 @@
+# Recipe: google/vit-base-patch16-224 → hardware-aware slim
+
+model: google/vit-base-patch16-224
+
+target_gpu: NVIDIA-RTX3090
+
+latency:
+  target_ms: 28.0
+  probe:
+    warmup: 10
+    iters: 30
+    every_steps: 200
+
+proxy:
+  family: ViT
+  vit:
+    scale_ms: 1.0
+    alpha_qkv: 1.0
+    alpha_scores: 1.0
+    alpha_out: 1.0
+    alpha_mlp: 1.0
+
+adapter:
+  vit_gating:
+    tau: 1.5
+    init_logit: 3.0
+    head_gating: true
+    ffn_group: 16
+    ffn_gating: true
+    hard_eval: true
+
+export:
+  warmup_steps: 150
+  rounding:
+    floor_groups: 1
+    multiple_groups: 8    # try multiples aligned to common kernels
+    min_keep_ratio: 0.0
+
+trainer:
+  amp: true
+  device: cuda
+  latency_target_ms: 28.0
+  real_probe_every: 50
+  probe_batch_override: 32
+  lr_gate: 1.0e-2
+  lr_linear: 1.0e-4
+  lr_affine: 3.0e-4
+  wd_linear: 1.0e-4
+  kd:
+    temperature: 2.0
+    alpha: 0.7
+  penalties:
+    l0: 0.02             # encourage sparsity
+    keep_floor_ratio: 0.1 # keep at least 10% groups per gate (soft)
+    bimodality: 1.0e-6
+  constraints:
+    min_keep_ratio: 0.05  # hard projection floor
+    min_groups: 1
+
+# Data paths: replace with your local folders
+
+data:
+  train_root: /data/imagenet100-224/train
+  val_root: /data/imagenet100-224/val
+  img_size: 224
+  batch_size: 32
+  workers: 8
+  limit_train: 2048   # for quick runs; remove for full dataset
+  limit_val: 256
+
+# Fine tuning after pruning
+finetune:
+  epochs: 10
+  lr: 3e-4
