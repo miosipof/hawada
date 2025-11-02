@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Optional
+import gc
 
 import torch
 import torch.nn as nn
@@ -137,91 +138,122 @@ class LagrangeTrainer:
         device = self.cfg.device
         self.student.train().to(device)
         self.teacher.to(device).eval()
-
+    
         running = 0.0
         seen = 0
         lam_real = self.lambda_
-
+    
         for step, batch in enumerate(loader, 1):
-            
-            # Support loaders returning (x, y) or just x
-            if isinstance(batch, (tuple, list)):
-                x = batch[0]
-            else:
-                x = batch
-        
-            x = x.to(device, non_blocking=True)
+            # Move batch to device in a type-safe way
+            batch = _move_batch_to_device(batch, device)
 
+            with torch.inference_mode():
+                t_logits = self.get_t(self.teacher, batch)  # [B,1,V]
+            # match AMP compute dtype to avoid upcasting later
+            if self.cfg.amp:
+                # infer autocast dtype from student params (bf16 or fp16)
+                sparam = next(self.student.parameters())
+                t_logits = t_logits.to(dtype=sparam.dtype, non_blocking=True)
+            
+                
             # -------- Pass A: WEIGHTS (KD only) --------
             self.opt_w.zero_grad(set_to_none=True)
-            
+    
             with torch.amp.autocast('cuda', enabled=self.cfg.amp):
-                s_logits = self.get_s(self.student, x)
-                with torch.no_grad():
-                    t_logits = self.get_t(self.teacher, x)
+                # Adapters receive the batch object (dict/tuple/tensor)
+                s_logits = self.get_s(self.student, batch)
+                # with torch.no_grad():
+                #     t_logits = self.get_t(self.teacher, batch)
                 loss_w = kd_loss(s_logits, t_logits, self.cfg.kd)
-
+    
             self.scaler.scale(loss_w).backward()
             # Prevent gate params from changing in pass A
             gate_params = self.opt_g.param_groups[0]["params"]
             self._zero_grads(gate_params)
-
+    
             if any(p.grad is not None for pg in self.opt_w.param_groups for p in pg["params"]):
                 self.scaler.step(self.opt_w)
                 self.scaler.update()
             else:
                 self.opt_w.zero_grad(set_to_none=True)
 
+            del s_logits, loss_w
+            gc.collect()
+            torch.cuda.empty_cache()    
+    
             # -------- Pass B: GATES (KD + sparsity + λ * gap) --------
             self.opt_g.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=self.cfg.amp):
-                s_logits = self.get_s(self.student, x)
-                with torch.no_grad():
-                    t_logits = self.get_t(self.teacher, x)
+                s_logits = self.get_s(self.student, batch)
+                # with torch.no_grad():
+                #     t_logits = self.get_t(self.teacher, batch)
                 kd_g = kd_loss(s_logits, t_logits, self.cfg.kd)
-
-                o1_ms = self.proxy.predict(self.student, x)
+    
+                # Proxy gets the batch object too; family-specific proxy can read (B,S) etc.
+                o1_ms = self.proxy.predict(self.student, batch)
                 gap = torch.relu(o1_ms - float(self.cfg.latency_target_ms))
                 reg = combined_penalty(self.student, self.cfg.penalties)
-
+    
                 loss_g = kd_g + _to_tensor(self.lambda_, o1_ms) * gap + reg
-
+    
             self.scaler.scale(loss_g).backward()
             # Prevent non-gate params from changing in pass B
             for pg in self.opt_w.param_groups:
                 self._zero_grads(pg["params"])
-
+    
             if self._has_grad(self.opt_g.param_groups[0]["params"]):
                 self.scaler.step(self.opt_g)
                 self.scaler.update()
             else:
                 self.opt_g.zero_grad(set_to_none=True)
 
+            
+    
             # -------- Dual (λ) update using proxy --------
             with torch.no_grad():
                 lam_proxy = max(0.0, self.lambda_ + self.cfg.dual.lr * (float(o1_ms.detach()) - self.cfg.latency_target_ms))
                 self.lambda_ = 0.5 * (lam_real + lam_proxy)
-
-            # -------- Periodic real probe & constraint projection --------
+    
+            # -------- Constraint projection, optional real probe --------
             project_gates_into_constraints(self.student, self.cfg.constraints)
-
+    
             if self.cfg.real_probe_every and (step % int(self.cfg.real_probe_every) == 0):
-                batch_for_ms = int(self.cfg.probe_batch_override or x.size(0))
-                slim = self.export_pruned(self.student, real_policy or self.export_policy, step)
-                mean_ms, p95_ms = measure_latency_ms(slim, (batch_for_ms, *x.shape[1:]), device=self.cfg.device)
+                # Build a probe shape for latency func if needed
+                try:
+                    from core.measure import measure_latency_text_ms  # text-friendly
+                    if isinstance(batch, dict) and "input_ids" in batch and torch.is_tensor(batch["input_ids"]):
+                        B, S = int(batch["input_ids"].size(0)), int(batch["input_ids"].size(1))
+                    else:
+                        # Fallback: try tensor-like batch
+                        x0 = batch["input_ids"] if isinstance(batch, dict) else (batch[0] if isinstance(batch, (tuple, list)) else batch)
+                        B = int(x0.size(0)); S = int(x0.size(1))
+                    slim = self.export_pruned(self.student, real_policy or self.export_policy, step)
+                    mean_ms, p95_ms = measure_latency_text_ms(slim, B=B, S=S, T=128, device=device)
+                except Exception:
+                    # If the project has a different profiler, retain compatibility:
+                    from .profiler import measure_latency_ms
+                    x0 = batch["input_ids"] if isinstance(batch, dict) else (batch[0] if isinstance(batch, (tuple, list)) else batch)
+                    shape = (int(x0.size(0)), *list(x0.shape[1:]))
+                    slim = self.export_pruned(self.student, real_policy or self.export_policy, step)
+                    mean_ms, p95_ms = measure_latency_ms(slim, shape, device=device)
+    
                 with torch.no_grad():
                     lam_real = max(0.0, self.lambda_ + self.cfg.dual.lr * (mean_ms - self.cfg.latency_target_ms))
-
+    
                 if (step % verbose_every) == 0:
                     print(
-                        f"Step {step}/{len(loader)} | KL loss = {float(loss_w.item()):.4f} | Gate loss = {float(loss_g.item()):.4f} | "
-                        f"proxy={float(o1_ms.detach()):.4f}ms | real_mean={mean_ms:.3f}ms p95={p95_ms:.3f}ms | λ={self.lambda_:.4f}"
+                        f"Step {step}/{len(loader)} | KL={float(loss_w.item()):.4f} | Gate={float(loss_g.item()):.4f} | "
+                        f"proxy={float(o1_ms.detach()):.3f}ms | real_mean={mean_ms:.3f}ms p95={p95_ms:.3f}ms | λ={self.lambda_:.4f}"
                     )
-
+    
             running += float(loss_g.detach())
-            seen += x.size(0)
+            seen += _batch_size(batch)
 
-        print(f"Epoch loss {running / max(1, seen):.4f}")
+            del s_logits, t_logits, o1_ms, kd_g, reg, loss_g
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+        print(f"Epoch loss {running / max(1, seen):.6f}")
         return self.lambda_
 
 
@@ -231,3 +263,46 @@ class LagrangeTrainer:
 
 def _to_tensor(val: float, like: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(val, device=like.device, dtype=like.dtype)
+
+def _move_batch_to_device(batch, device: str):
+    """
+    Supports:
+      - dict with keys 'input_ids' and optional 'attention_mask'
+      - (x,) or (x, y) tuples/lists -> move each tensor-like to device
+      - single Tensor
+    Converts attention_mask to bool (preferred by HF SDPA).
+    """
+    if isinstance(batch, dict):
+        out = {}
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                v = v.to(device, non_blocking=True)
+                if k == "attention_mask" and v.dtype != torch.bool:
+                    v = v.to(torch.bool)
+            out[k] = v
+        return out
+
+    if isinstance(batch, (tuple, list)):
+        moved = []
+        for v in batch:
+            if torch.is_tensor(v):
+                v = v.to(device, non_blocking=True)
+            moved.append(v)
+        return type(batch)(moved)
+
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+
+    # Unknown type: return as-is (adapters/proxy should handle it)
+    return batch
+
+
+def _batch_size(batch) -> int:
+    """Best-effort batch size for logging/averages."""
+    if isinstance(batch, dict) and "input_ids" in batch and torch.is_tensor(batch["input_ids"]):
+        return int(batch["input_ids"].size(0))
+    if torch.is_tensor(batch):
+        return int(batch.size(0))
+    if isinstance(batch, (tuple, list)) and len(batch) and torch.is_tensor(batch[0]):
+        return int(batch[0].size(0))
+    return 1
