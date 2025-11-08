@@ -177,7 +177,7 @@ class LagrangeTrainer:
             else:
                 self.opt_w.zero_grad(set_to_none=True)
 
-            del s_logits, loss_w
+            del s_logits
             gc.collect()
             torch.cuda.empty_cache()    
     
@@ -249,7 +249,7 @@ class LagrangeTrainer:
             running += float(loss_g.detach())
             seen += _batch_size(batch)
 
-            del s_logits, t_logits, o1_ms, kd_g, reg, loss_g
+            del s_logits, t_logits, o1_ms, kd_g, reg, loss_g, loss_w
             torch.cuda.empty_cache()
             gc.collect()
     
