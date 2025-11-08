@@ -239,6 +239,10 @@ class LagrangeTrainer:
     
                 with torch.no_grad():
                     lam_real = max(0.0, self.lambda_ + self.cfg.dual.lr * (mean_ms - self.cfg.latency_target_ms))
+
+                scale_correction = mean_ms / max(1e-9, o1_ms.detach())
+                self.proxy.cfg.scale_ms = 0.9 * self.proxy.cfg.scale_ms + 0.1 * scale_correction * self.proxy.cfg.scale_ms
+
     
                 if (step % verbose_every) == 0:
                     print(

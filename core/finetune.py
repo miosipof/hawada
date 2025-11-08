@@ -96,9 +96,9 @@ def finetune_student(
                         vloss = kd_loss(vs, vt, cfg.kd)
                     val_loss += float(vloss)
                     vseen += vx.size(0)
-            print(f"Epoch {ep+1}/{cfg.epochs}: train={running/max(1, seen):.4f}, val={val_loss/max(1, vseen):.4f}")
+            print(f"Epoch {ep+1}/{cfg.epochs}: train={running/max(1, seen):.6f}, val={val_loss/max(1, vseen):.6f}")
         else:
-            print(f"Epoch {ep+1}/{cfg.epochs}: train={running/max(1, seen):.4f}")
+            print(f"Epoch {ep+1}/{cfg.epochs}: train={running/max(1, seen):.6f}")
 
     student.eval()
     return student

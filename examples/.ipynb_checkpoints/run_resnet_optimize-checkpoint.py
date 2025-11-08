@@ -60,24 +60,7 @@ def _images_from_batch(batch):
     raise TypeError(f"Unsupported batch type for images: {type(batch)}")
 
 
-class ProxyShim:
-    """Adapts a shape-based proxy to the trainer API (model, x)->ms.
-    Our ResNetLatencyProxy expects a sample shape; the trainer passes a tensor.
-    """
-    def __init__(self, inner: ResNetLatencyProxy):
-        self.inner = inner
 
-    def predict(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        x = _images_from_batch(x)
-        shape = x.shape if isinstance(x, torch.Tensor) else x
-        if not isinstance(shape, (tuple, list)):
-            raise ValueError("ProxyShim: x must be a Tensor or a shape tuple")
-        if len(shape) != 4:
-            raise ValueError("ProxyShim: expected NCHW shape")
-        return self.inner.predict(model, tuple(shape))
-
-    def calibrate(self, *args, **kwargs):
-        return self.inner.calibrate(*args, **kwargs)
 
 
 # ------------------------------ Build pack ------------------------------
@@ -111,12 +94,11 @@ def build_from_recipe(path: str):
     train_loader, val_loader = build_imagenet_like_loaders(dcfg)
 
     # --- Proxy calibration ---
-    base_proxy = ResNetLatencyProxy()
-    proxy = ProxyShim(base_proxy)
+    proxy = ResNetLatencyProxy()
     B = int(dcfg.get("batch_size", 64))
     img_size = int(dcfg.get("img_size", 224))
     base_ms = proxy.calibrate(student, keepall_export_fn=ResNetAdapter.export_keepall,
-                              profiler_fn=measure_latency_ms, sample_shape=(B, 3, img_size, img_size), device=device)
+                              profiler_fn=measure_latency_ms, sample=torch.randn((B, 3, img_size, img_size),device=device), device=device)
 
     # --- Trainer config ---
     tcfg = cfg.get("trainer", {})
