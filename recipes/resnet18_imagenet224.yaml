@@ -14,33 +14,37 @@ gates:
 
 # Training (gates + weights) with latency constraint
 trainer:
-  amp: true
-  use_grad_scaler: true
+  amp: false
+  use_grad_scaler: false
+  gate_warmup_steps: 0
+  mse_weight: 0.1
+  early_stopping_patience: 3
+  early_stopping_lambda: 1e-5
   kd:
-    temperature: 3.0
-    alpha: 1.0
+    temperature: 4.0
+    alpha: 2.0
   lagrange:
-    real_every: 10         # measure real latency every N steps (export-eval policy)
-    lr_gate: 1.0e-3        # mirrors param groups defaults
-    lr_weight: 1.0e-4
-    min_keep_ratio: 0.7   # floor during training/export
+    real_every: 5         # measure real latency every N steps (export-eval policy)
+    lr_gate: 1.0e-4        
+    lr_weight: 5.0e-5
+    min_keep_ratio: 0.8    # floor during training/export
     sparsity_reg: 1.0e-4
-    tau_target_scale: 0.7  # target = 0.5 * keep-all latency
+    tau_target_scale: 0.7  # target = tau_target_scale * keep-all latency
 
 # Data
 data:
   train_root: /data/imagenet100-224/train
-  val_root: /data/imagenet100-224/val
-  batch_size: 64
+  batch_size: 512
   num_workers: 8
   img_size: 224
 
 # Export search grid (kernel-aware)
 export:
   warmup_steps: 0
-  grid_multiple_groups: [2, 3, 4, 5, 8]
+  grid_multiple_groups: [2, 3, 4, 5]
 
 # Fine-tuning after export
 finetune:
-  epochs: 3
-  lr: 3.0e-4
+  epochs: 30
+  lr: 1e-3
+  wd: 5e-5

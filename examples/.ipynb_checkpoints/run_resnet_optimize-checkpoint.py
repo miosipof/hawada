@@ -28,7 +28,7 @@ from core.proxy_cost import ResNetLatencyProxy
 from core.profiler import measure_latency_ms
 from core.train import LagrangeTrainer, TrainerConfig
 from core.distill import KDConfig
-from core.finetune import FinetuneConfig, finetune_student
+from core.finetune import FinetuneConfig, finetune_student, recalibrate_bn_stats
 from data.vision import build_imagenet_like_loaders
 
 
@@ -91,6 +91,9 @@ def build_from_recipe(path: str):
 
     # --- Data ---
     dcfg = cfg.get("data", {})
+
+    # dcfg["limit_train"] = 1000
+    # dcfg["limit_val"] = 1000
     train_loader, val_loader = build_imagenet_like_loaders(dcfg)
 
     # --- Proxy calibration ---
@@ -108,6 +111,10 @@ def build_from_recipe(path: str):
         kd=kd,
         amp=bool(tcfg.get("amp", True)),
         use_grad_scaler=bool(tcfg.get("use_grad_scaler", True)),
+        gate_warmup_steps = int(tcfg.get("gate_warmup_steps", 0)),
+        mse_weight = float(tcfg.get("mse_weight", 0.0)),
+        early_stopping_patience = int(tcfg.get("early_stopping_patience", 0)),
+        early_stopping_lambda = float(tcfg.get("early_stopping_lambda", 1e-4)),
         device=device,
     )
 
@@ -127,7 +134,7 @@ def build_from_recipe(path: str):
             min_keep_ratio=float(tcfg.get("lagrange", {}).get("min_keep_ratio", 0.25)),
         ),
         min_keep_ratio=float(tcfg.get("lagrange", {}).get("min_keep_ratio", 0.25)),
-    )
+    ) 
 
     pack = {
         "student": student,
@@ -199,9 +206,9 @@ def main():
         trainer = LagrangeTrainer(
             student=student,
             teacher=teacher,
-            proxy=proxy,  # shim implements predict(model, x)
-            adapter_get_student_logits=lambda m, batch: student(_images_from_batch(batch)),
-            adapter_get_teacher_logits=lambda m, batch: teacher(_images_from_batch(batch)),
+            proxy=proxy,  
+            adapter_get_student_logits=lambda m, batch: m(_images_from_batch(batch)),
+            adapter_get_teacher_logits=lambda m, batch: m(_images_from_batch(batch)).detach(),
             adapter_export_keepall=ResNetAdapter.export_keepall,
             adapter_export_pruned=lambda m, pol, step: ResNetAdapter.export_pruned(m, pol, step),
             export_policy=export_policy,
@@ -209,9 +216,23 @@ def main():
         )
     
         # --- Train ---
+        lambdas = []
         for ep in range(args.epochs):
             print(f"=== Epoch {ep+1}/{args.epochs} ===")
-            trainer.train_epoch(train_loader)
+            lam = trainer.train_epoch(train_loader)
+            lambdas.append(lam)
+
+            last = lambdas[:trcfg.early_stopping_patience]
+            last = [x for x in last if x < trcfg.early_stopping_lambda]
+            if len(last) == trcfg.early_stopping_patience:
+                print(f"Early stopping: lambda < {trcfg.early_stopping_lambda} for last {trcfg.early_stopping_patience} epochs")
+                break
+
+                
+        out_path = os.path.join(args.outdir, "resnet18_gated.pth")
+        torch.save(student, out_path)
+        print("Saved gated model to", out_path)
+        
 
         # --- Export search (kernel-aware) ---
         print("Running export grid search...")
@@ -232,12 +253,18 @@ def main():
     
         # --- BN recalibration ---
         print("Recalibrating BN stats on the slim model...")
-        ResNetAdapter.bn_recalibration(slim, train_loader, num_batches=200, device=device)
+        ResNetAdapter.bn_recalibration(slim, train_loader, num_batches=1000, device=device)
 
+        out_path = os.path.join(args.outdir, "resnet18_slim.pth")
+        torch.save(slim, out_path)
+        print("Saved pruned model to", out_path)
+        
     else:
         slim = torch.load(args.slim, map_location=device, weights_only=False).to(device)
         print(f"Skipping training. Pruned model loaded from {args.slim}. [To run with training, drop '--slim' argument]")
 
+
+        
     if args.finetune is True:
         # --- Fine-tune the slim model with KD ---
         ft_epochs = int(pack["recipe"].get("finetune", {}).get("epochs", 10))
@@ -245,20 +272,26 @@ def main():
         ft_cfg = FinetuneConfig(
             epochs=ft_epochs,
             lr=float(pack["recipe"].get("finetune", {}).get("lr", 3e-4)),
+            wd=float(pack["recipe"].get("finetune", {}).get("wd", 1e-5)),
             kd=KDConfig(**pack["recipe"].get("trainer", {}).get("kd", {})),
             amp=bool(pack["recipe"].get("trainer", {}).get("amp", True)),
+            mse_weight = float(pack["recipe"].get("trainer", {}).get("mse_weight", 0.0)),
             device=device,
             log_every=50,
         )
+        
+        recalibrate_bn_stats(slim, train_loader, max_batches=1000)
         slim = finetune_student(
             slim,
             teacher,
             train_loader,
-            get_student_logits=lambda m, x: ResNetAdapter.get_logits(m, x),
-            get_teacher_logits=lambda m, x: teacher(x),
+            get_student_logits=lambda m, batch: m(_images_from_batch(batch)),
+            get_teacher_logits=lambda m, batch: m(_images_from_batch(batch)).detach(),
             cfg=ft_cfg,
             val_loader=val_loader,
         )
+
+        recalibrate_bn_stats(slim, train_loader, max_batches=1000)
 
         out_path = os.path.join(args.outdir, "resnet18_slim.pth")
         torch.save(slim, out_path)

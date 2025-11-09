@@ -39,22 +39,24 @@ def kl_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T:
     p_t = F.softmax(teacher_logits / T, dim=-1)
     return F.kl_div(p_s, p_t, reduction="batchmean") * (T * T)
 
-
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, cfg: KDConfig) -> torch.Tensor:
     return cfg.alpha * kl_divergence(student_logits, teacher_logits, T=cfg.temperature)
 
-
+def mse_reg(student_logits: torch.Tensor, teacher_logits: torch.Tensor, T: float = 2.0) -> torch.Tensor:
+    mse = F.mse_loss(student_logits,teacher_logits, reduction="mean")
+    return mse * (T * T)
+    
 def soft_ce(student_logits: torch.Tensor, soft_targets: torch.Tensor) -> torch.Tensor:
     """Soft cross-entropy: expects `soft_targets` already normalized."""
     logp = F.log_softmax(student_logits, dim=-1)
     return -(soft_targets * logp).sum(dim=-1).mean()
-
 
 def cosine_feature_loss(student_feats: torch.Tensor, teacher_feats: torch.Tensor) -> torch.Tensor:
     """1 - cosine similarity averaged over batch and time/patch dims."""
     s = F.normalize(student_feats, dim=-1)
     t = F.normalize(teacher_feats, dim=-1)
     return (1.0 - (s * t).sum(dim=-1)).mean()
+
 
 
 # -----------------------------------------------------------------------------

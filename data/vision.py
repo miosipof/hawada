@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import os
+import random
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -75,8 +76,8 @@ def build_imagenet_like_loaders(cfg):
 
     train_root = get("train_root")
     val_root   = get("val_root")
-    if not train_root or not val_root:
-        raise ValueError("data.train_root and data.val_root must be provided")
+    if not train_root:
+        raise ValueError("data.train_root must be provided")
 
     img_size    = int(get("img_size", 224))
     batch_size  = int(get("batch_size", 64))
@@ -90,8 +91,20 @@ def build_imagenet_like_loaders(cfg):
     from torchvision import datasets
     from torch.utils.data import DataLoader, Subset
 
-    train_ds = SafeImageFolder(train_root, transform=train_tf)
-    val_ds   = SafeImageFolder(val_root,   transform=val_tf)
+    if val_root:
+        train_ds = SafeImageFolder(train_root, transform=train_tf)
+        val_ds   = SafeImageFolder(val_root,   transform=val_tf)
+    else:
+        dataset = SafeImageFolder(train_root, transform=train_tf)
+
+        random.seed(42)
+        all_idx = list(range(len(dataset)))
+        random.shuffle(all_idx)
+        train_idx = all_idx[:int(0.8*len(dataset))]
+        val_idx = all_idx[int(0.8*len(dataset)):]
+
+        train_ds = torch.utils.data.Subset(dataset, train_idx)
+        val_ds   = torch.utils.data.Subset(dataset, val_idx)
 
     if limit_train is not None:
         n = min(int(limit_train), len(train_ds))

@@ -32,7 +32,7 @@ import gc
 import torch
 import torch.nn as nn
 
-from .distill import KDConfig, kd_loss
+from .distill import KDConfig, kd_loss, mse_reg
 from .gates import PenaltyWeights, Constraints, combined_penalty, project_gates_into_constraints, collect_param_groups
 from .proxy_cost import LatencyProxy
 from .profiler import measure_latency_ms
@@ -58,6 +58,11 @@ class TrainerConfig:
     latency_target_ms: float = 30.0
     real_probe_every: int = 0        # steps; 0 disables real probes
     probe_batch_override: Optional[int] = None
+    gate_warmup_steps: int = 0 # Freeze gates for early steps
+    mse_weight: float = 0.0
+
+    early_stopping_patience: int = 0
+    early_stopping_lambda: float = 1e-4
 
     amp: bool = True
     device: str = "cuda"
@@ -120,6 +125,7 @@ class LagrangeTrainer:
 
         self.scaler = torch.amp.GradScaler('cuda', enabled=(cfg.amp and cfg.use_grad_scaler))
         self.lambda_: float = 0.0
+        self.mse_weight = cfg.mse_weight
 
     # ---- internal helpers -----------------------------------------------------
     def _zero_grads(self, params):
@@ -142,12 +148,16 @@ class LagrangeTrainer:
         running = 0.0
         seen = 0
         lam_real = self.lambda_
+
+        total_steps = len(loader)
+
     
         for step, batch in enumerate(loader, 1):
             # Move batch to device in a type-safe way
             batch = _move_batch_to_device(batch, device)
 
-            with torch.inference_mode():
+            # with torch.inference_mode():
+            with torch.no_grad():
                 t_logits = self.get_t(self.teacher, batch)  # [B,1,V]
             # match AMP compute dtype to avoid upcasting later
             if self.cfg.amp:
@@ -164,7 +174,8 @@ class LagrangeTrainer:
                 s_logits = self.get_s(self.student, batch)
                 # with torch.no_grad():
                 #     t_logits = self.get_t(self.teacher, batch)
-                loss_w = kd_loss(s_logits, t_logits, self.cfg.kd)
+                mse = self.mse_weight*mse_reg(s_logits, t_logits, self.cfg.kd.temperature)
+                loss_w = kd_loss(s_logits, t_logits, self.cfg.kd) + mse
     
             self.scaler.scale(loss_w).backward()
             # Prevent gate params from changing in pass A
@@ -180,34 +191,37 @@ class LagrangeTrainer:
             del s_logits
             gc.collect()
             torch.cuda.empty_cache()    
-    
-            # -------- Pass B: GATES (KD + sparsity + λ * gap) --------
-            self.opt_g.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=self.cfg.amp):
-                s_logits = self.get_s(self.student, batch)
-                # with torch.no_grad():
-                #     t_logits = self.get_t(self.teacher, batch)
-                kd_g = kd_loss(s_logits, t_logits, self.cfg.kd)
-    
-                # Proxy gets the batch object too; family-specific proxy can read (B,S) etc.
-                o1_ms = self.proxy.predict(self.student, batch)
-                gap = torch.relu(o1_ms - float(self.cfg.latency_target_ms))
-                reg = combined_penalty(self.student, self.cfg.penalties)
-    
-                loss_g = kd_g + _to_tensor(self.lambda_, o1_ms) * gap + reg
-    
-            self.scaler.scale(loss_g).backward()
-            # Prevent non-gate params from changing in pass B
-            for pg in self.opt_w.param_groups:
-                self._zero_grads(pg["params"])
-    
-            if self._has_grad(self.opt_g.param_groups[0]["params"]):
-                self.scaler.step(self.opt_g)
-                self.scaler.update()
-            else:
-                self.opt_g.zero_grad(set_to_none=True)
 
-            
+            if step > int(self.cfg.gate_warmup_steps):
+        
+                # -------- Pass B: GATES (KD + sparsity + λ * gap) --------
+                self.opt_g.zero_grad(set_to_none=True)
+                with torch.amp.autocast('cuda', enabled=self.cfg.amp):
+                    s_logits = self.get_s(self.student, batch)
+                    # with torch.no_grad():
+                    #     t_logits = self.get_t(self.teacher, batch)
+                    kd_g = kd_loss(s_logits, t_logits, self.cfg.kd)
+        
+                    # Proxy gets the batch object too; family-specific proxy can read (B,S) etc.
+                    o1_ms = self.proxy.predict(self.student, batch)
+                    gap = torch.relu(o1_ms - float(self.cfg.latency_target_ms))
+                    reg = combined_penalty(self.student, self.cfg.penalties)
+                    mse = self.mse_weight*mse_reg(s_logits, t_logits, self.cfg.kd.temperature)
+                    loss_g = kd_g + _to_tensor(self.lambda_, o1_ms) * gap + reg + mse
+        
+                self.scaler.scale(loss_g).backward()
+                # Prevent non-gate params from changing in pass B
+                for pg in self.opt_w.param_groups:
+                    self._zero_grads(pg["params"])
+        
+                if self._has_grad(self.opt_g.param_groups[0]["params"]):
+                    self.scaler.step(self.opt_g)
+                    self.scaler.update()
+                else:
+                    self.opt_g.zero_grad(set_to_none=True)
+            else:
+                o1_ms = self.proxy.predict(self.student, batch)
+                s_logits = loss_g = kd_g = reg = torch.tensor(0.0, device=device)
     
             # -------- Dual (λ) update using proxy --------
             with torch.no_grad():
@@ -240,14 +254,15 @@ class LagrangeTrainer:
                 with torch.no_grad():
                     lam_real = max(0.0, self.lambda_ + self.cfg.dual.lr * (mean_ms - self.cfg.latency_target_ms))
 
-                scale_correction = mean_ms / max(1e-9, o1_ms.detach())
-                self.proxy.cfg.scale_ms = 0.9 * self.proxy.cfg.scale_ms + 0.1 * scale_correction * self.proxy.cfg.scale_ms
+                # scale_correction = mean_ms / max(1e-9, o1_ms.detach())
+                # self.proxy.cfg.scale_ms = 0.9 * self.proxy.cfg.scale_ms + 0.1 * scale_correction * self.proxy.cfg.scale_ms
 
     
                 if (step % verbose_every) == 0:
                     print(
-                        f"Step {step}/{len(loader)} | KL={float(loss_w.item()):.4f} | Gate={float(loss_g.item()):.4f} | "
-                        f"proxy={float(o1_ms.detach()):.3f}ms | real_mean={mean_ms:.3f}ms p95={p95_ms:.3f}ms | λ={self.lambda_:.4f}"
+                        f"Step {step}/{len(loader)} | KL={float(loss_w.item()):.6f} | MSE={float(mse.item()):.6f} | "
+                        f"Gate={float(loss_g.item()):.6f} | "
+                        f"proxy={float(o1_ms.detach()):.3f}ms | real_mean={mean_ms:.3f}ms p95={p95_ms:.3f}ms | λ={self.lambda_:.6f}"
                     )
     
             running += float(loss_g.detach())
