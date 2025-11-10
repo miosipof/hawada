@@ -61,7 +61,7 @@ trainer:
 
 data:
   train_root: /data/imagenet100-224/train
-  val_root: /data/imagenet100-224/val
+  # val_root: /data/imagenet100-224/val
   img_size: 224
   batch_size: 32
   workers: 8

@@ -47,7 +47,31 @@ def parse_args():
     ap.add_argument("--finetune", type=bool, default=True)    
     return ap.parse_args()
 
-
+def _images_from_batch(batch):
+    return batch
+    # # (images, labels) or [images, labels]
+    # if isinstance(batch, (tuple, list)):
+    #     # print(f"was tuple/tist, len={len(batch)}", batch[0].shape, batch[1].shape)
+    #     return batch[0]
+    # # dict-style datasets
+    # if isinstance(batch, dict):
+    #     for k in ("pixel_values", "images", "inputs"):
+    #         v = batch.get(k, None)
+    #         if torch.is_tensor(v):
+    #             # print(f"was dict, {k}", v.shape)
+    #             return v
+    #     # fallback to first tensor value
+    #     for v in batch.values():
+    #         if torch.is_tensor(v):
+    #             # print(f"was dict", v.shape)
+    #             return v
+    #     raise TypeError("Batch dict has no tensor-like image field")
+    # # plain tensor
+    # if torch.is_tensor(batch):
+    #     print("was tensor", batch.shape)
+    #     return batch
+    # raise TypeError(f"Unsupported batch type for images: {type(batch)}")
+    
 def build_from_recipe(recipe_path: str):
     with open(recipe_path, "r") as f:
         R = yaml.safe_load(f)
@@ -119,8 +143,8 @@ def build_from_recipe(recipe_path: str):
     )
 
     # --- Adapter-specific logits providers
-    get_s = lambda m, x: ViTAdapter.get_logits(m, x, head=student_head)
-    get_t = lambda m, x: ViTAdapter.get_logits(m, x, head=teacher_head)
+    get_s = lambda m, x: ViTAdapter.get_logits(m, _images_from_batch(x), head=student_head)
+    get_t = lambda m, x: ViTAdapter.get_logits(m, _images_from_batch(x), head=teacher_head)
 
     return {
         "student": student,
