@@ -52,6 +52,28 @@ class ViTGatingConfig:
     hard_eval: bool = True  # use hard masks in eval mode during forward
 
 
+
+def _encoder_layers(m: nn.Module):
+    """
+    Return the sequence of Transformer blocks for HF ViT.
+    Supports:
+      - ViTModel:                 m.encoder.layer
+      - ViTForImageClassification: m.vit.encoder.layer
+    """
+    # ViTModel path
+    enc = getattr(m, "encoder", None)
+    if enc is not None and hasattr(enc, "layer"):
+        return enc.layer
+
+    # ViTForImageClassification path
+    vit = getattr(m, "vit", None)
+    if vit is not None and hasattr(vit, "encoder") and hasattr(vit.encoder, "layer"):
+        return vit.encoder.layer
+
+    raise ValueError("Provided model does not look like a HF ViT (missing *.encoder.layer)")
+
+
+
 # -----------------------------------------------------------------------------
 # Gated attention wrapper
 # -----------------------------------------------------------------------------
@@ -88,9 +110,13 @@ class GatedSelfAttentionHF(nn.Module):
     def kept_heads_soft(self) -> torch.Tensor:
         return self.head_gate.probs().sum()
 
-    def forward(self, hidden_states, head_mask=None, output_attentions=False):
+    def forward(self, hidden_states, head_mask=None):
         B, N, _ = hidden_states.shape
         H, Dh = self.num_heads, self.head_dim
+
+        wdev = self.q_proj.weight.device
+        if hidden_states.device != wdev:
+            hidden_states = hidden_states.to(wdev, non_blocking=True)
 
         q_lin = self.q_proj(hidden_states)
         k_lin = self.k_proj(hidden_states)
@@ -122,7 +148,7 @@ class GatedSelfAttentionHF(nn.Module):
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, H * Dh)
         attn_out = self.out_proj(attn_out)
-        return (attn_out, None) if output_attentions else (attn_out,)
+        return attn_out, None
 
 
 # -----------------------------------------------------------------------------
@@ -132,8 +158,7 @@ class GatedSelfAttentionHF(nn.Module):
 class ViTAdapter:
     def __init__(self, model: nn.Module):
         self.model = model
-        if not hasattr(model, "encoder") or not hasattr(model.encoder, "layer"):
-            raise ValueError("Provided model does not look like a HF ViT (missing encoder.layer)")
+        _ = _encoder_layers(model)
 
     # ---------- Gating attachment ----------
     def attach_gates(self, cfg: ViTGatingConfig) -> nn.Module:
@@ -142,7 +167,7 @@ class ViTAdapter:
         D = int(getattr(m.config, "hidden_size", 768))
         Dh = D // H
 
-        for layer in m.encoder.layer:
+        for layer in _encoder_layers(m):
             # Attention heads
             if cfg.head_gating:
                 attn_container = layer.attention
@@ -175,27 +200,23 @@ class ViTAdapter:
     def get_logits(model: nn.Module, x: torch.Tensor, *, head: Optional[nn.Module] = None) -> torch.Tensor:
         out = model(pixel_values=x)
         if hasattr(out, "logits"):
-            return out.logits
-        if hasattr(out, "last_hidden_state"):
+            return out.logits                        # ViTForImageClassification path
+        if hasattr(out, "last_hidden_state"):        # ViTModel path (needs external head)
             if head is None:
                 raise ValueError("Provide a classification head when using ViTModel without logits.")
             cls_tok = out.last_hidden_state[:, 0, :]
-
-            # ensure head is on same device as cls_tok
             if next(head.parameters(), torch.tensor([], device=cls_tok.device)).device != cls_tok.device:
                 head = head.to(cls_tok.device)
-    
             return head(cls_tok)
         raise ValueError("Model output lacks logits and last_hidden_state.")
+
 
     # ---------- Exporters ----------
     @staticmethod
     @torch.no_grad()
     def export_keepall(model_with_gates: nn.Module) -> nn.Module:
         slim = deepcopy_eval_cpu(model_with_gates)
-        if not hasattr(slim, "encoder") or not hasattr(slim.encoder, "layer"):
-            return slim
-        for layer in slim.encoder.layer:
+        for layer in _encoder_layers(slim):
             # Attention: unwrap gate
             attn_container = layer.attention
             if isinstance(getattr(attn_container, "attention", None), GatedSelfAttentionHF):
@@ -235,7 +256,7 @@ class ViTAdapter:
         slim = deepcopy_eval_cpu(model_with_gates)
         warm = (step < warmup_steps)
     
-        for layer in slim.encoder.layer:
+        for layer in _encoder_layers(slim):
             # --- Attention heads ---
             attn_container = layer.attention
             gat = getattr(attn_container, "attention", None)
@@ -304,6 +325,7 @@ class ViTAdapter:
                
     
         return slim
+
 
 
 

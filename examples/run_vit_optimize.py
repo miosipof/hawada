@@ -18,7 +18,9 @@ import os
 from functools import partial
 
 import torch
-from transformers import ViTModel, ViTForImageClassification
+import torchvision
+from transformers import ViTModel, ViTForImageClassification, AutoModel, AutoImageProcessor
+
 import yaml
 
 import sys, pathlib
@@ -31,8 +33,8 @@ from core.profiler import measure_latency_ms, ProfileSettings
 from core.train import LagrangeTrainer, TrainerConfig
 from core.distill import KDConfig, ClsHead
 from core.export import ExportPolicy as CoreExportPolicy, Rounding as CoreRounding
-from adapters.huggingface.vit import ViTAdapter, ViTGatingConfig, ViTExportPolicy, vit_search_best_export
-from data.vision import build_imagenet_like_loaders, VisionDataConfig
+from adapters.huggingface.vit import ViTAdapter, ViTGatingConfig, ViTExportPolicy, vit_search_best_export, _encoder_layers
+from data.vision import build_imagenet_like_loaders, VisionDataConfig, _images_from_batch
 
 from core.finetune import FinetuneConfig, finetune_student
 
@@ -47,48 +49,47 @@ def parse_args():
     ap.add_argument("--finetune", type=bool, default=True)    
     return ap.parse_args()
 
-def _images_from_batch(batch):
-    return batch
-    # # (images, labels) or [images, labels]
-    # if isinstance(batch, (tuple, list)):
-    #     # print(f"was tuple/tist, len={len(batch)}", batch[0].shape, batch[1].shape)
-    #     return batch[0]
-    # # dict-style datasets
-    # if isinstance(batch, dict):
-    #     for k in ("pixel_values", "images", "inputs"):
-    #         v = batch.get(k, None)
-    #         if torch.is_tensor(v):
-    #             # print(f"was dict, {k}", v.shape)
-    #             return v
-    #     # fallback to first tensor value
-    #     for v in batch.values():
-    #         if torch.is_tensor(v):
-    #             # print(f"was dict", v.shape)
-    #             return v
-    #     raise TypeError("Batch dict has no tensor-like image field")
-    # # plain tensor
-    # if torch.is_tensor(batch):
-    #     print("was tensor", batch.shape)
-    #     return batch
-    # raise TypeError(f"Unsupported batch type for images: {type(batch)}")
-    
+
+
+def make_vit_transforms(model_id: str, img_size: int, train: bool):
+    proc = AutoImageProcessor.from_pretrained(model_id)
+    # proc will do: ToTensor (0..1), Normalize(mean=0.5, std=0.5), resize, center crop
+    # We just add train-time spatial augs before proc
+    aug = []
+    if train:
+        aug = [
+            torchvision.transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
+            torchvision.transforms.RandomHorizontalFlip()
+        ]
+    return torchvision.transforms.Compose([
+        *aug,
+        torchvision.transforms.Resize(img_size, interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
+        torchvision.transforms.CenterCrop(img_size),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize(mean=proc.image_mean, std=proc.image_std),
+    ])
+
+
+
 def build_from_recipe(recipe_path: str):
     with open(recipe_path, "r") as f:
         R = yaml.safe_load(f)
 
     # --- Models
     model_id = R["model"]
+    base_model_id = R["base_model"]
     device = R.get("trainer", {}).get("device", "cuda")
 
-    student = ViTModel.from_pretrained(model_id)
-    teacher = ViTModel.from_pretrained(model_id)
-    base_head_model = ViTForImageClassification.from_pretrained(model_id)
+    student = ViTForImageClassification.from_pretrained(model_id)
+    teacher = ViTForImageClassification.from_pretrained(model_id)
+    # base_head_model = ViTForImageClassification.from_pretrained(model_id)
 
     # Heads for logits when using ViTModel
     hidden = int(student.config.hidden_size)
-    num_classes = int(base_head_model.config.num_labels)
-    student_head = ClsHead(hidden_size=hidden, num_classes=num_classes, base_head=base_head_model.classifier).to(device)
-    teacher_head = ClsHead(hidden_size=hidden, num_classes=num_classes, base_head=base_head_model.classifier).to(device)
+    # num_classes = int(base_head_model.config.num_labels)
+    num_classes = int(student.config.num_labels)
+    student_head = None # ClsHead(hidden_size=hidden, num_classes=num_classes, base_head=base_head_model.classifier).to(device)
+    teacher_head = None # ClsHead(hidden_size=hidden, num_classes=num_classes, base_head=base_head_model.classifier).to(device)
 
     # --- Adapter & gates
     gate_cfg = ViTGatingConfig(**R.get("adapter", {}).get("vit_gating", {}))
@@ -97,16 +98,19 @@ def build_from_recipe(recipe_path: str):
 
     # --- Data
     data_cfg = VisionDataConfig(**R.get("data", {}))
-    train_loader, val_loader = build_imagenet_like_loaders(data_cfg)
+    B = data_cfg.batch_size
+    img_size = data_cfg.img_size
+    
+    train_tf = make_vit_transforms(base_model_id, img_size, train=True)
+    val_tf   = make_vit_transforms(base_model_id, img_size, train=False)
+    train_loader, val_loader = build_imagenet_like_loaders(data_cfg, train_tf, val_tf)
 
     # --- Proxy + calibration
     proxy_cfg = ViTProxyConfig(**R.get("proxy", {}).get("vit", {}))
-    proxy = ViTLatencyProxy(proxy_cfg)
+    proxy = ViTLatencyProxy(proxy_cfg).to(device)
 
     # Calibrate scale on keep-all student
-    keepall = ViTAdapter.export_keepall(student)
-    B = data_cfg.batch_size
-    img_size = data_cfg.img_size
+    keepall = ViTAdapter.export_keepall(student).to(device)
     calibrate_scale(proxy, keepall, (B, 3, img_size, img_size), measure_latency_ms, device=device)
 
     # --- Export policy
@@ -127,24 +131,30 @@ def build_from_recipe(recipe_path: str):
     kd_cfg = KDConfig(**R.get("trainer", {}).get("kd", {}))
     pen = R.get("trainer", {}).get("penalties", {})
     cons = R.get("trainer", {}).get("constraints", {})
+    mse_weight = float(R.get("trainer", {}).get("mse_weight", 0.0))
     tcfg = TrainerConfig(
         kd=kd_cfg,
         penalties=TrainerConfig.penalties.__class__(**pen),
         constraints=TrainerConfig.constraints.__class__(**cons),
-        latency_target_ms=float(R.get("trainer", {}).get("latency_target_ms", 30.0)),
-        real_probe_every=int(R.get("trainer", {}).get("real_probe_every", 0)),
-        probe_batch_override=R.get("trainer", {}).get("probe_batch_override", None),
+        mse_weight=mse_weight,
         amp=bool(R.get("trainer", {}).get("amp", True)),
-        device=device,
-        lr_gate=float(R.get("trainer", {}).get("lr_gate", 1e-2)),
-        lr_linear=float(R.get("trainer", {}).get("lr_linear", 1e-4)),
-        lr_affine=float(R.get("trainer", {}).get("lr_affine", 3e-4)),
-        wd_linear=float(R.get("trainer", {}).get("wd_linear", 1e-4)),
+        real_probe_every=int(R.get("trainer", {}).get("lagrange", {}).get("real_every", 10)),        
+        lr_gate   = float(R.get("trainer", {}).get("lagrange", {}).get("lr_gate", 1e-2)),
+        lr_linear = float(R.get("trainer", {}).get("lagrange", {}).get("lr_linear", 1e-4)),
+        lr_affine = float(R.get("trainer", {}).get("lagrange", {}).get("lr_affine", 3e-4)),
+        wd_linear = float(R.get("trainer", {}).get("lagrange", {}).get("wd_linear", 1e-4)),
+        device=device,        
     )
 
+    print("mse_weight",mse_weight)
+
     # --- Adapter-specific logits providers
-    get_s = lambda m, x: ViTAdapter.get_logits(m, _images_from_batch(x), head=student_head)
-    get_t = lambda m, x: ViTAdapter.get_logits(m, _images_from_batch(x), head=teacher_head)
+    get_t = lambda m, batch: ViTAdapter.get_logits(
+        m, _images_from_batch(batch).to(next(m.parameters()).device, non_blocking=True), head=teacher_head
+    ).detach()
+    get_s = lambda m, batch: ViTAdapter.get_logits(
+        m, _images_from_batch(batch).to(next(m.parameters()).device, non_blocking=True), head=student_head
+    )
 
     return {
         "student": student,
@@ -176,7 +186,7 @@ def make_vit_policy(head_mult: int, ffn_snap: int):
 
 def main():
     args = parse_args()
-    
+
     os.makedirs(args.outdir, exist_ok=True)
 
     set_seed(args.seed)
@@ -187,6 +197,9 @@ def main():
     proxy = pack["proxy"]  # type: ignore[index]
     export_policy = pack["export_policy"]  # type: ignore[index]
     probe_policy = pack["probe_policy"]  # type: ignore[index]
+    img_size = pack["recipe"]["data"]["img_size"]
+    B = max(1, int(pack["recipe"]["data"]["batch_size"] // 4)) 
+    device = pack["device"]
 
     if args.slim is None:
         trainer = LagrangeTrainer(
@@ -210,7 +223,6 @@ def main():
     
         # Run the grid search for the current num_heads
         num_heads = int(student.config.num_attention_heads)
-        B = max(1, int(pack["recipe"]["data"]["batch_size"] // 4))
         img_size = pack["recipe"]["data"]["img_size"]
         search = vit_search_best_export(
             student,
@@ -233,8 +245,6 @@ def main():
         # slim = ViTAdapter.export_pruned(student, export_policy, step_for_export)
     
         # Measure latency before/after on a small val batch
-        img_size = pack["recipe"]["data"]["img_size"]
-        B = max(1, int(pack["recipe"]["data"]["batch_size"] // 4))
         mean_keep, p95_keep = measure_latency_ms(ViTAdapter.export_keepall(student), (B, 3, img_size, img_size), device=pack["device"])  # type: ignore[index]
         mean_slim, p95_slim = measure_latency_ms(slim, (B, 3, img_size, img_size), device=pack["device"])  # type: ignore[index]
     
@@ -242,7 +252,7 @@ def main():
     
         # Save artifacts
         torch.save(slim, os.path.join(args.outdir, "vit_slim.pth"))
-        torch.save(student, os.path.join(args.outdir, "vit_student_with_gates.pth"))
+        torch.save(student, os.path.join(args.outdir, "vit_gated.pth"))
     
         print(f"Saved pruned model to {os.path.join(args.outdir, 'vit_slim.pth')}")
     
@@ -267,8 +277,8 @@ def main():
             slim,
             teacher,
             pack["train_loader"],
-            get_student_logits=lambda m, x: ViTAdapter.get_logits(m, x, head=pack["student_head"]),
-            get_teacher_logits=lambda m, x: ViTAdapter.get_logits(m, x, head=pack["teacher_head"]),
+            get_student_logits=pack["get_s"],
+            get_teacher_logits=pack["get_t"],
             cfg=ft_cfg,
             val_loader=pack["val_loader"],
         )

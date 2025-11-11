@@ -1,11 +1,12 @@
 # Recipe: google/vit-base-patch16-224 → hardware-aware slim
 
-model: google/vit-base-patch16-224
+base_model: google/vit-base-patch16-224
+model: hawada/vit-base-patch16-224-in1k
 
-target_gpu: NVIDIA-RTX3090
+target_gpu: NVIDIA-RTX4090
 
 latency:
-  target_ms: 28.0
+  # target_ms: 28.0
   probe:
     warmup: 10
     iters: 30
@@ -31,31 +32,59 @@ adapter:
 
 export:
   warmup_steps: 150
-  rounding:
-    floor_groups: 1
-    multiple_groups: 8    # try multiples aligned to common kernels
-    min_keep_ratio: 0.0
+  grid_multiple_groups: [2, 3, 4, 5, 6, 7, 8]
+  # rounding:
+  #   floor_groups: 1
+  #   multiple_groups: 8    # try multiples aligned to common kernels
+  #   min_keep_ratio: 0.0
+
+
+
 
 trainer:
-  amp: true
-  device: cuda
-  latency_target_ms: 28.0
-  real_probe_every: 50
-  probe_batch_override: 32
-  lr_gate: 1.0e-2
-  lr_linear: 1.0e-4
-  lr_affine: 3.0e-4
-  wd_linear: 1.0e-4
+  amp: false
+  use_grad_scaler: false
+  gate_warmup_steps: 0
+  mse_weight: 0.1
+  early_stopping_patience: 3
+  early_stopping_lambda: 1e-5
   kd:
-    temperature: 2.0
-    alpha: 0.7
-  penalties:
-    l0: 0.02             # encourage sparsity
-    keep_floor_ratio: 0.1 # keep at least 10% groups per gate (soft)
-    bimodality: 1.0e-6
-  constraints:
-    min_keep_ratio: 0.05  # hard projection floor
-    min_groups: 1
+    temperature: 4.0
+    alpha: 2.0
+  lagrange:
+    real_every: 50         # measure real latency every N steps (export-eval policy)
+    lr_gate: 1.0e-3        
+    lr_weight: 5.0e-5
+    lr_linear: 1.0e-4
+    lr_affine: 3.0e-4
+    wd_linear: 1.0e-4    
+    min_keep_ratio: 0.75    # floor during training/export
+    sparsity_reg: 1.0e-4
+    tau_target_scale: 0.9  # target = tau_target_scale * keep-all latency
+    
+# trainer:
+#   amp: true
+#   device: cuda
+#   latency_target_ms: 28.0
+#   real_probe_every: 10
+#   probe_batch_override: 32
+#   mse_weight: 1.0
+#   early_stopping_patience: 3
+#   early_stopping_lambda: 1e-5  
+#   lr_gate: 1.0e-2
+#   lr_linear: 1.0e-4
+#   lr_affine: 3.0e-4
+#   wd_linear: 1.0e-4
+#   kd:
+#     temperature: 4.0
+#     alpha: 2.0
+#   penalties:
+#     l0: 0.02             # encourage sparsity
+#     keep_floor_ratio: 0.7 # keep at least 10% groups per gate (soft)
+#     bimodality: 1.0e-6
+#   constraints:
+#     min_keep_ratio: 0.05  # hard projection floor
+#     min_groups: 1
 
 # Data paths: replace with your local folders
 
@@ -63,12 +92,13 @@ data:
   train_root: /data/imagenet100-224/train
   # val_root: /data/imagenet100-224/val
   img_size: 224
-  batch_size: 32
+  batch_size: 64
   workers: 8
-  limit_train: 2048   # for quick runs; remove for full dataset
-  limit_val: 256
+  #limit_train: 2048   # for quick runs; remove for full dataset
+  # limit_val: 256
 
 # Fine tuning after pruning
 finetune:
   epochs: 10
   lr: 3e-4
+  wd: 5e-4

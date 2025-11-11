@@ -161,6 +161,15 @@ class ViTProxyConfig:
     alpha_out: float = 1.0
     alpha_mlp: float = 1.0
 
+def _vit_layers(m):
+    enc = getattr(m, "encoder", None)
+    if enc is not None and hasattr(enc, "layer"):
+        return enc.layer
+    vit = getattr(m, "vit", None)
+    if vit is not None and hasattr(vit, "encoder") and hasattr(vit.encoder, "layer"):
+        return vit.encoder.layer
+    raise TypeError("Expected a HF ViT with *.encoder.layer (ViTModel or ViTForImageClassification).")
+
 
 class ViTLatencyProxy(LatencyProxy):
     """Latency proxy for ViT models. Accepts batches or (N,C,H,W) tuples."""
@@ -246,7 +255,8 @@ class ViTLatencyProxy(LatencyProxy):
 
         default_hidden = _as_like(anchor, int(getattr(cfg, "intermediate_size", 4 * int(D))))
 
-        for blk in model.encoder.layer:
+        layers = _vit_layers(model)
+        for blk in layers:
             heads_soft = Hh if warm else (self._soft_heads_from_block(blk) or Hh)
 
             # FFN hidden expectation
@@ -319,6 +329,7 @@ def calibrate_scale(proxy: ViTLatencyProxy, model: nn.Module, sample: TensorOrBa
             shape = tuple(t.shape)
         sample_t = torch.randn(*shape, device=device)
 
+    sample_t = sample_t.to(device)
     model = model.to(device).eval()
     mean_ms, _ = measure_fn(model, shape, device=device)
     soft_ms = proxy.predict(model, sample_t).item()

@@ -69,7 +69,7 @@ class SafeImageFolder(datasets.ImageFolder):
         return classes, class_to_idx
 
 
-def build_imagenet_like_loaders(cfg):
+def build_imagenet_like_loaders(cfg, train_tf=None, val_tf=None):
     # allow dict or object with attributes; provide defaults
     def get(k, default=None):
         return cfg.get(k, default) if isinstance(cfg, dict) else getattr(cfg, k, default)
@@ -85,8 +85,11 @@ def build_imagenet_like_loaders(cfg):
     limit_train = get("limit_train", None)
     limit_val   = get("limit_val", None)
 
-    train_tf = make_train_transform(img_size)
-    val_tf   = make_val_transform(img_size)
+    if train_tf is None:
+        train_tf = make_train_transform(img_size)
+
+    if val_tf is None:
+        val_tf   = make_val_transform(img_size)
 
     from torchvision import datasets
     from torch.utils.data import DataLoader, Subset
@@ -120,6 +123,34 @@ def build_imagenet_like_loaders(cfg):
     return train_loader, val_loader
 
 
+def _images_from_batch(batch):
+    """
+    Accepts dict/tuple/tensor/list[tensor] and returns BCHW float32 on the student’s device.
+    """
+    if isinstance(batch, dict):
+        x = batch.get("pixel_values") or batch.get("images")
+        if x is None:
+            for v in batch.values():
+                if torch.is_tensor(v):
+                    x = v; break
+    elif isinstance(batch, (tuple, list)):
+        x = batch[0] if len(batch) else batch
+    else:
+        x = batch
+
+    if isinstance(x, list):
+        if not all(torch.is_tensor(t) for t in x):
+            raise TypeError("Expected list[Tensor] for images")
+        x = torch.stack(x, 0)
+
+    if not torch.is_tensor(x):
+        raise TypeError(f"Images must be Tensor or list[Tensor], got {type(x)}")
+
+    if x.dtype == torch.uint8:
+        x = x.float().div_(255)
+
+    return x.contiguous()
+    
 # -----------------------------------------------------------------------------
 # Synthetic dataset (for CI / smoke tests)
 # -----------------------------------------------------------------------------

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # data + adapters
-from data.vision import VisionDataConfig, build_imagenet_like_loaders
+from data.vision import VisionDataConfig, build_imagenet_like_loaders, _images_from_batch
 from adapters.huggingface.vit import ViTAdapter
 from adapters.torchvision.resnet import ResNetAdapter
 
@@ -117,22 +117,28 @@ def main():
                 return self.fc(self.norm(cls_token))
         
     
-        teacher_name = cfg.teacher.get("hf_name", "google/vit-base-patch16-224")
-        student_name = cfg.student.get("hf_name", "google/vit-base-patch16-224")
+        teacher_name = cfg.model
+        student_name = cfg.model
     
-        teacher_backbone = ViTModel.from_pretrained(teacher_name).to(dev).eval()
+        teacher = ViTForImageClassification.from_pretrained(teacher_name).to(dev).eval()
     
-        base_head = ViTForImageClassification.from_pretrained(student_name)
-        hidden = base_head.config.hidden_size
-        num_labels = base_head.config.num_labels
-    
-        teacher_head = _LocalHead(hidden, num_labels, base_head.classifier).to(dev).eval()
-        student_head = _LocalHead(hidden, num_labels, base_head.classifier).to(dev).eval()
-    
+        # base_head = ViTForImageClassification.from_pretrained(student_name)
+        # hidden = base_head.config.hidden_size
+        # num_labels = base_head.config.num_labels
+
         student = torch.load(args.slim, map_location=dev, weights_only=False).to(dev).eval()
+        hidden = int(student.config.hidden_size)
+        num_classes = int(student.config.num_labels)
+        teacher_head = None #_LocalHead(hidden, num_labels, base_head.classifier).to(dev).eval()
+        student_head = None # _LocalHead(hidden, num_labels, base_head.classifier).to(dev).eval()
     
-        get_s = lambda x: ViTAdapter.get_logits(student, x, head=student_head)
-        get_t = lambda x: ViTAdapter.get_logits(teacher_backbone, x, head=teacher_head)
+        # --- Adapter-specific logits providers
+        get_t = lambda batch: ViTAdapter.get_logits(
+            teacher, _images_from_batch(batch).to(next(teacher.parameters()).device, non_blocking=True), head=teacher_head
+        ).detach()
+        get_s = lambda batch: ViTAdapter.get_logits(
+            student, _images_from_batch(batch).to(next(student.parameters()).device, non_blocking=True), head=student_head
+        )
 
 
     else:  # resnet
