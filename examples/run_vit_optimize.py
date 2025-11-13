@@ -28,7 +28,7 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 # Local imports (run from repo root)
 from core.utils import set_seed
-from core.proxy_cost import ViTLatencyProxy, ViTProxyConfig, calibrate_scale
+from core.proxy_cost import ViTLatencyProxy, ViTProxyConfig
 from core.profiler import measure_latency_ms, ProfileSettings
 from core.train import LagrangeTrainer, TrainerConfig
 from core.distill import KDConfig, ClsHead
@@ -111,7 +111,12 @@ def build_from_recipe(recipe_path: str):
 
     # Calibrate scale on keep-all student
     keepall = ViTAdapter.export_keepall(student).to(device)
-    calibrate_scale(proxy, keepall, (B, 3, img_size, img_size), measure_latency_ms, device=device)
+    latency_scale = proxy.calibrate(keepall, (B, 3, img_size, img_size), measure_latency_ms, device=device)  
+    base_ms, _ = measure_latency_ms(keepall, (B, 3, img_size, img_size), device=device)
+
+    print(f"Latency proxy scale set to: {latency_scale:.6e}")  # было '... ms'
+    print(f"Keep-all latency: {base_ms:.4f} ms on batch size = {B}")
+    
 
     # --- Export policy
     round_cfg = CoreRounding(**R.get("export", {}).get("rounding", {}))
@@ -127,15 +132,22 @@ def build_from_recipe(recipe_path: str):
         rounding=CoreRounding(floor_groups=1, multiple_groups=1, min_keep_ratio=0.0),
     )
 
+    # latency target
+    tau_scale = float(R.get("trainer", {}).get("lagrange", {}).get("tau_target_scale", 0.7))
+    latency_target_ms = tau_scale * float(base_ms)    
+
+    print(f"Target latency = {base_ms:.4f} * {tau_scale:.2f} ~ {base_ms*tau_scale:.4f}")
+
     # --- Trainer config
     kd_cfg = KDConfig(**R.get("trainer", {}).get("kd", {}))
-    pen = R.get("trainer", {}).get("penalties", {})
-    cons = R.get("trainer", {}).get("constraints", {})
+    penalties = R.get("trainer", {}).get("penalties", {})
+    constraints = R.get("trainer", {}).get("constraints", {})
     mse_weight = float(R.get("trainer", {}).get("mse_weight", 0.0))
-    tcfg = TrainerConfig(
+    trcfg = TrainerConfig(
+        latency_target_ms=latency_target_ms,  
         kd=kd_cfg,
-        penalties=TrainerConfig.penalties.__class__(**pen),
-        constraints=TrainerConfig.constraints.__class__(**cons),
+        penalties=TrainerConfig.penalties.__class__(**penalties),
+        constraints=TrainerConfig.constraints.__class__(**constraints),
         mse_weight=mse_weight,
         amp=bool(R.get("trainer", {}).get("amp", True)),
         real_probe_every=int(R.get("trainer", {}).get("lagrange", {}).get("real_every", 10)),        
@@ -145,8 +157,6 @@ def build_from_recipe(recipe_path: str):
         wd_linear = float(R.get("trainer", {}).get("lagrange", {}).get("wd_linear", 1e-4)),
         device=device,        
     )
-
-    print("mse_weight",mse_weight)
 
     # --- Adapter-specific logits providers
     get_t = lambda m, batch: ViTAdapter.get_logits(
@@ -165,7 +175,7 @@ def build_from_recipe(recipe_path: str):
         "export_policy": export_policy,
         "probe_policy": probe_policy,
         "proxy": proxy,
-        "trainer_cfg": tcfg,
+        "trainer_cfg": trcfg,
         "train_loader": train_loader,
         "val_loader": val_loader,
         "get_s": get_s,
@@ -198,7 +208,7 @@ def main():
     export_policy = pack["export_policy"]  # type: ignore[index]
     probe_policy = pack["probe_policy"]  # type: ignore[index]
     img_size = pack["recipe"]["data"]["img_size"]
-    B = max(1, int(pack["recipe"]["data"]["batch_size"] // 4)) 
+    B = max(1, int(pack["recipe"]["data"]["batch_size"])) 
     device = pack["device"]
 
     if args.slim is None:
@@ -271,7 +281,7 @@ def main():
             kd=KDConfig(**pack["recipe"].get("trainer", {}).get("kd", {})),
             amp=bool(pack["recipe"].get("trainer", {}).get("amp", True)),
             device=pack["device"],
-            log_every=50,
+            log_every=200,
         )
         slim = finetune_student(
             slim,
@@ -281,13 +291,14 @@ def main():
             get_teacher_logits=pack["get_t"],
             cfg=ft_cfg,
             val_loader=pack["val_loader"],
+            save_best=True
         )
         torch.save(slim, os.path.join(args.outdir, "vit_slim_finetune.pth"))
         
     else:
         print("Skipping fine-tuning. [To run fine-tuning, set '--finetuning True' or omit this argument]")
 
-    print(f"Starting benchmarking with batch size = {B}...")
+    print(f"\nStarting benchmarking with batch size = {B}...")
         
     mean_keep, p95_keep = measure_latency_ms(ViTAdapter.export_keepall(student), (B, 3, img_size, img_size), device=pack["device"])
     mean_slim, p95_slim = measure_latency_ms(slim, (B, 3, img_size, img_size), device=pack["device"])

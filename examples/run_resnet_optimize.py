@@ -104,36 +104,35 @@ def build_from_recipe(path: str):
                               profiler_fn=measure_latency_ms, sample=torch.randn((B, 3, img_size, img_size),device=device), device=device)
 
     # --- Trainer config ---
-    tcfg = cfg.get("trainer", {})
-    kd = KDConfig(**tcfg.get("kd", {}))
+    kd = KDConfig(**cfg.get("trainer", {}).get("kd", {}))
 
     trcfg = TrainerConfig(
         kd=kd,
-        amp=bool(tcfg.get("amp", True)),
-        use_grad_scaler=bool(tcfg.get("use_grad_scaler", True)),
-        gate_warmup_steps = int(tcfg.get("gate_warmup_steps", 0)),
-        mse_weight = float(tcfg.get("mse_weight", 0.0)),
-        early_stopping_patience = int(tcfg.get("early_stopping_patience", 0)),
-        early_stopping_lambda = float(tcfg.get("early_stopping_lambda", 1e-4)),
+        amp=bool(cfg.get("trainer", {}).get("amp", True)),
+        use_grad_scaler=bool(cfg.get("trainer", {}).get("use_grad_scaler", True)),
+        gate_warmup_steps = int(cfg.get("trainer", {}).get("gate_warmup_steps", 0)),
+        mse_weight = float(cfg.get("trainer", {}).get("mse_weight", 0.0)),
+        early_stopping_patience = int(cfg.get("trainer", {}).get("early_stopping_patience", 0)),
+        early_stopping_lambda = float(cfg.get("trainer", {}).get("early_stopping_lambda", 1e-4)),
         device=device,
     )
 
     # latency target
-    tau_scale = float(tcfg.get("lagrange", {}).get("tau_target_scale", 0.7))
+    tau_scale = float(cfg.get("trainer", {}).get("lagrange", {}).get("tau_target_scale", 0.7))
     trcfg.latency_target_ms = tau_scale * float(base_ms)
 
     # Optional knobs mapped into TrainerConfig
-    trcfg.real_probe_every = int(tcfg.get("lagrange", {}).get("real_every", 10))
+    trcfg.real_probe_every = int(cfg.get("trainer", {}).get("lagrange", {}).get("real_every", 10))
 
     # Export policy used during periodic probes
     export_policy = ResNetExportPolicy(
         warmup_steps=0,
         rounding=CoreRounding(
             floor_groups=1,
-            multiple_groups=int(tcfg.get("lagrange", {}).get("multiple_groups_probe", 1)),
-            min_keep_ratio=float(tcfg.get("lagrange", {}).get("min_keep_ratio", 0.25)),
+            multiple_groups=int(cfg.get("trainer", {}).get("lagrange", {}).get("multiple_groups_probe", 1)),
+            min_keep_ratio=float(cfg.get("trainer", {}).get("lagrange", {}).get("min_keep_ratio", 0.25)),
         ),
-        min_keep_ratio=float(tcfg.get("lagrange", {}).get("min_keep_ratio", 0.25)),
+        min_keep_ratio=float(cfg.get("trainer", {}).get("lagrange", {}).get("min_keep_ratio", 0.25)),
     ) 
 
     pack = {

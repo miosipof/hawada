@@ -32,59 +32,64 @@ adapter:
 
 export:
   warmup_steps: 150
-  grid_multiple_groups: [2, 3, 4, 5, 6, 7, 8]
+  grid_multiple_groups: [2,3,4,5,6,7,8] # [2, 3, 4, 5, 6, 7, 8]
   # rounding:
   #   floor_groups: 1
   #   multiple_groups: 8    # try multiples aligned to common kernels
   #   min_keep_ratio: 0.0
 
 
-
-
-trainer:
-  amp: false
-  use_grad_scaler: false
-  gate_warmup_steps: 0
-  mse_weight: 0.1
-  early_stopping_patience: 3
-  early_stopping_lambda: 1e-5
-  kd:
-    temperature: 4.0
-    alpha: 2.0
-  lagrange:
-    real_every: 50         # measure real latency every N steps (export-eval policy)
-    lr_gate: 1.0e-3        
-    lr_weight: 5.0e-5
-    lr_linear: 1.0e-4
-    lr_affine: 3.0e-4
-    wd_linear: 1.0e-4    
-    min_keep_ratio: 0.75    # floor during training/export
-    sparsity_reg: 1.0e-4
-    tau_target_scale: 0.9  # target = tau_target_scale * keep-all latency
-    
 # trainer:
-#   amp: true
-#   device: cuda
-#   latency_target_ms: 28.0
-#   real_probe_every: 10
-#   probe_batch_override: 32
-#   mse_weight: 1.0
+#   amp: false
+#   use_grad_scaler: false
+#   gate_warmup_steps: 0
+#   mse_weight: 0.1
 #   early_stopping_patience: 3
-#   early_stopping_lambda: 1e-5  
-#   lr_gate: 1.0e-2
-#   lr_linear: 1.0e-4
-#   lr_affine: 3.0e-4
-#   wd_linear: 1.0e-4
+#   early_stopping_lambda: 1e-5
 #   kd:
 #     temperature: 4.0
 #     alpha: 2.0
-#   penalties:
-#     l0: 0.02             # encourage sparsity
-#     keep_floor_ratio: 0.7 # keep at least 10% groups per gate (soft)
-#     bimodality: 1.0e-6
-#   constraints:
-#     min_keep_ratio: 0.05  # hard projection floor
-#     min_groups: 1
+#   lagrange:
+#     real_every: 50         # measure real latency every N steps (export-eval policy)
+#     lr_gate: 4.0e-3        
+#     lr_weight: 5.0e-5
+#     lr_linear: 1.0e-4
+#     lr_affine: 3.0e-4
+#     wd_linear: 1.0e-4    
+#     min_keep_ratio: 0.9    # floor during training/export
+#     sparsity_reg: 1.0e-4
+#     tau_target_scale: 0.9  # target = tau_target_scale * keep-all latency
+    
+trainer:
+  amp: true
+  device: cuda
+  probe_batch_override: 64
+  mse_weight: 0.1
+  early_stopping_patience: 3
+  early_stopping_lambda: 1e-5  
+  lr_gate: 1.0e-3
+  lr_linear: 1.0e-4
+  lr_affine: 3.0e-4
+  wd_linear: 1.0e-4
+  kd:
+    temperature: 4.0
+    alpha: 2.0
+  penalties:
+    l0: 0.01                 # encourage sparsity
+    keep_floor_ratio: 0.5 
+    bimodality: 1.0e-6
+  constraints:
+    min_keep_ratio: 0.1     # hard projection floor
+    min_groups: 1
+  lagrange:
+    real_every: 100         # measure real latency every N steps (export-eval policy)
+    lr_gate: 1.0e-3        
+    lr_weight: 5.0e-4
+    lr_linear: 1.0e-4
+    lr_affine: 3.0e-4
+    wd_linear: 1.0e-4    
+    tau_target_scale: 0.7  # target = tau_target_scale * keep-all latency
+
 
 # Data paths: replace with your local folders
 
@@ -99,6 +104,6 @@ data:
 
 # Fine tuning after pruning
 finetune:
-  epochs: 10
+  epochs: 20
   lr: 3e-4
-  wd: 5e-4
+  wd: 5e-3

@@ -11,6 +11,8 @@ import torch.nn as nn
 from core.distill import KDConfig, kd_loss, mse_reg
 from core.utils import ensure_trainable_parameters
 
+import copy
+
 
 @dataclass
 class FinetuneConfig:
@@ -22,7 +24,7 @@ class FinetuneConfig:
     # "auto" -> bf16 if supported else fp16; "bf16" | "fp16" | "off" also allowed
     amp_dtype: str = "auto"
     device: str = "cuda"
-    log_every: int = 50
+    log_every: int = 200
     # diagnostics
     grad_check_every: int = 50
     grad_warn_if_zero_steps: int = 2   # consecutive checks with zero grad -> warn
@@ -113,6 +115,7 @@ def finetune_student(
     cfg: FinetuneConfig = FinetuneConfig(),
     val_loader=None,
     on_step: Optional[Callable[[int, float], None]] = None,
+    save_best=False
 ) -> nn.Module:
     """Fine-tune a pruned student against a frozen teacher using KD."""
     dev = cfg.device
@@ -147,6 +150,9 @@ def finetune_student(
     T_max = cfg.kd.temperature
     T_min = 2.0
     kd_conf = cfg.kd
+
+    best_state = None
+    best_val = float("inf")
 
     for ep in range(cfg.epochs):
         student.train()
@@ -230,15 +236,32 @@ def finetune_student(
                     vt = get_teacher_logits(teacher, vx).float()
                     with autocast_ctx:
                         vs = get_student_logits(student, vx)
-                    vloss = kd_loss(vs.float(), vt, kd_conf)
+
+                    vs32 = vs.float()
+                    vmse = cfg.mse_weight*mse_reg(vs32, vt, kd_conf.temperature)
+                    vloss = kd_loss(vs32, vt, kd_conf) + vmse
                     val_loss += float(vloss.detach()) * vx.size(0)
                     vseen += vx.size(0)
+
+            mean_val = val_loss / max(1, vseen)
+            print("\n------------------------------------------------")
             print(f"Epoch {ep+1}/{cfg.epochs}: T={kd_conf.temperature:.2f}, train={running / max(1, seen):.6f}, "
-                  f"val={val_loss / max(1, vseen):.6f}")
+                  f"val={mean_val:.6f}")
+
+            if save_best and (mean_val < best_val):
+                best_val = mean_val
+                best_state = copy.deepcopy(student.state_dict())
+
+            print("------------------------------------------------\n")
+            
         else:
             print(f"Epoch {ep+1}/{cfg.epochs}: train={running / max(1, seen):.6f}")
 
         scheduler.step()
-        
+
+    if save_best and val_loader is not None and best_state is not None:
+        student.load_state_dict(best_state)
+    
     student.eval()
     return student
+

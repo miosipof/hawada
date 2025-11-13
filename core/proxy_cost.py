@@ -306,36 +306,21 @@ class ViTLatencyProxy(LatencyProxy):
         inter = int(getattr(cfg, "intermediate_size", 3072))
         return ("ViT", shp, heads, hidden, inter)
 
-
-# -----------------------------------------------------------------------------
-# Calibration helpers for ViT
-# -----------------------------------------------------------------------------
-
-@torch.inference_mode()
-def calibrate_scale(proxy: ViTLatencyProxy, model: nn.Module, sample: TensorOrBatch, measure_fn, *, device: str = "cuda") -> float:
-    """Set proxy scale so that keep-all student matches measured ms.
-
-    `measure_fn(model, shape_or_tensor)` should return `(mean_ms, p95_ms)`.
-    """
-    if torch.is_tensor(sample):
-        sample_t = sample
-        shape = tuple(sample.shape)
-    else:
-        # if batch-like, synthesize a tensor using first tensor's shape
-        if isinstance(sample, (tuple, list)) and len(sample) == 4:
-            shape = tuple(sample)
-        else:
-            t = _first_tensor(sample)
-            shape = tuple(t.shape)
-        sample_t = torch.randn(*shape, device=device)
-
-    sample_t = sample_t.to(device)
-    model = model.to(device).eval()
-    mean_ms, _ = measure_fn(model, shape, device=device)
-    soft_ms = proxy.predict(model, sample_t).item()
-    proxy.cfg.scale_ms = float(mean_ms / max(soft_ms, 1e-9))
-    return proxy.cfg.scale_ms
-
+    @torch.no_grad()
+    def calibrate(self, model: nn.Module, shape: tuple, measure_fn, *, device: str = "cuda") -> float:
+        """Set proxy scale so that keep-all student matches measured ms.
+    
+        `measure_fn(model, shape_or_tensor)` should return `(mean_ms, p95_ms)`.
+        """
+        
+        sample_t = torch.randn(shape, device=device)
+    
+        sample_t = sample_t.to(device)
+        model = model.to(device).eval()
+        mean_ms, _ = measure_fn(model, shape, device=device)
+        soft_ms = self.predict(model, sample_t).item()
+        self.cfg.scale_ms = float(mean_ms / max(soft_ms, 1e-9))
+        return self.cfg.scale_ms
 
 # ------------------------------ ResNet Proxy ------------------------------
 
