@@ -37,7 +37,6 @@ from .gates import PenaltyWeights, Constraints, combined_penalty, project_gates_
 from .proxy_cost import LatencyProxy
 from .profiler import measure_latency_ms
 
-
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
@@ -230,7 +229,8 @@ class LagrangeTrainer:
     
             # -------- Constraint projection, optional real probe --------
             project_gates_into_constraints(self.student, self.cfg.constraints)
-    
+
+
             if self.cfg.real_probe_every and (step % int(self.cfg.real_probe_every) == 0):
                 # Build a probe shape for latency func if needed
                 try:

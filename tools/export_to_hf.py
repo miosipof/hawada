@@ -47,9 +47,21 @@ import torch
 
 # Optional but recommended
 from huggingface_hub import HfApi, create_repo, upload_folder, metadata_update
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, AutoModel
+from transformers import ViTModel, ViTForImageClassification
+
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import shutil
+import torch.nn as nn
+from transformers import AutoConfig, ViTForImageClassification
+from huggingface_hub import HfApi, create_repo, upload_folder
+from copy import deepcopy
 
 # --- tiny utils --------------------------------------------------------------
+
+
 
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
@@ -113,6 +125,235 @@ def _save_model_card_and_meta(dst: Path, title: str, task: str, meta: dict, incl
     _write_readme(dst, title, task, {**meta, "repo_slim": repo_slim})
     # Add a lightweight model index (optional)
     (dst / "model_index.json").write_text(json.dumps({"task": task, **meta}, indent=2), encoding="utf-8")
+
+
+
+# --- ViT export ------------------------------------------------------------
+
+from copy import deepcopy
+from transformers import AutoConfig
+
+def _infer_vit_config_from_state_dict(sd: dict, base_cfg: "AutoConfig") -> "AutoConfig":
+    """Infer a ViT config (num_heads, intermediate_size, num_labels, maybe hidden_size)
+    from a pruned state_dict, starting from base_cfg as a template.
+    """
+    cfg = deepcopy(base_cfg)
+
+    # ---- 1) attention heads / hidden size ----
+    # We look at layer 0 query weight: [all_head_size, hidden_size]
+    q_key = None
+    for k in sd.keys():
+        if "encoder.layer.0.attention.attention.query.weight" in k:
+            q_key = k
+            break
+    if q_key is not None:
+        q_w = sd[q_key]  # [all_head_size, hidden_size]
+        all_head_size, hidden_size = q_w.shape
+
+        # base head dim (usually hidden_size_base / num_heads_base)
+        base_head_dim = base_cfg.hidden_size // base_cfg.num_attention_heads
+        if all_head_size % base_head_dim == 0:
+            num_heads = all_head_size // base_head_dim
+        else:
+            # fallback: keep base, but loggable if you want
+            num_heads = base_cfg.num_attention_heads
+
+        cfg.hidden_size = int(hidden_size)
+        cfg.num_attention_heads = int(num_heads)
+
+    # ---- 2) FFN intermediate size ----
+    inter_key = None
+    for k in sd.keys():
+        if "encoder.layer.0.intermediate.dense.weight" in k:
+            inter_key = k
+            break
+    if inter_key is not None:
+        inter_w = sd[inter_key]  # [intermediate_size, hidden_size]
+        intermediate_size, _ = inter_w.shape
+        cfg.intermediate_size = int(intermediate_size)
+
+    # ---- 3) classifier output size (num_labels) ----
+    cls_key = None
+    for k in sd.keys():
+        if k.endswith("classifier.weight"):
+            cls_key = k
+            break
+    if cls_key is not None:
+        cls_w = sd[cls_key]  # [num_labels, hidden_size]
+        num_labels, _ = cls_w.shape
+        cfg.num_labels = int(num_labels)
+
+        # keep label2id/id2label in sync if it exists
+        if hasattr(cfg, "label2id") and isinstance(cfg.label2id, dict):
+            # shrink or rebuild mapping
+            labels = list(cfg.label2id.keys())
+            labels = labels[:num_labels] or [str(i) for i in range(num_labels)]
+            cfg.label2id = {lbl: i for i, lbl in enumerate(labels)}
+            cfg.id2label = {i: lbl for lbl, i in cfg.label2id.items()}
+
+    return cfg
+
+def _load_vit_state_dict_and_config(
+    ckpt_path: Path,
+    base_id: str,
+) -> Tuple[dict, "AutoConfig"]:
+    """
+    Normalize a ViT checkpoint into (state_dict, config).
+
+    - If ckpt is a full nn.Module: use its .state_dict() and .config if present.
+    - If ckpt is already a state_dict: infer config (num_heads, FFN width, num_labels)
+      from shapes, starting from the base config.
+    """
+    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    base_cfg = AutoConfig.from_pretrained(base_id, trust_remote_code=True)
+
+    # Full module case
+    if isinstance(obj, nn.Module):
+        sd = obj.state_dict()
+        cfg = getattr(obj, "config", None)
+        if cfg is None:
+            # not HF-style, just fall back to base
+            cfg = base_cfg
+        return sd, cfg
+
+    # Raw state_dict case
+    if isinstance(obj, dict):
+        # Heuristic: pure param dict -> infer pruned config
+        if all(isinstance(v, torch.Tensor) for v in obj.values()):
+            sd = obj
+            cfg = _infer_vit_config_from_state_dict(sd, base_cfg)
+            return sd, cfg
+
+    raise TypeError(f"Unexpected checkpoint object type at {ckpt_path}: {type(obj)}")
+
+
+def export_vit_variants(
+    base_id: str,
+    student_ckpt: Path,
+    slim_ckpt: Path,
+    repo_gated: str,
+    repo_slim: str,
+    token: Optional[str],
+    private: bool,
+    include_code: List[str],
+    push: bool = True,
+):
+    api = HfApi(token=token)
+
+    base_cfg = AutoConfig.from_pretrained(base_id, trust_remote_code=True)
+
+    # ---------- (a) Gated student: state_dict + custom code ----------
+    gated_dir = Path("hf_export_gated_vit")
+    if gated_dir.exists():
+        shutil.rmtree(gated_dir)
+    _ensure_dir(gated_dir)
+
+    base_cfg.save_pretrained(gated_dir)
+
+    sd_gated = torch.load(student_ckpt, map_location="cpu", weights_only=False)
+    torch.save(sd_gated, gated_dir / "pytorch_model.bin")
+
+    if include_code:
+        _copy_code_tree(gated_dir, include_code)
+        (gated_dir / "custom_code.py").write_text(
+            "# Marker file so Hub shows 'custom code' banner.\n",
+            encoding="utf-8",
+        )
+
+    _save_model_card_and_meta(
+        gated_dir,
+        title=repo_gated,
+        task="image-classification",
+        meta={"base_id": base_id, "variant": "gated-student"},
+        include_code=include_code,
+        repo_slim=repo_slim,
+    )
+
+    if push:
+        create_repo(repo_gated, token=token, private=private, exist_ok=True)
+        upload_folder(repo_id=repo_gated, folder_path=str(gated_dir), token=token)
+        print(f"[ok] Pushed gated student → {repo_gated}")
+
+    # ---------- (b) Slim model: upload full module as custom model ----------
+    slim_dir = Path("hf_export_slim_vit")
+    if slim_dir.exists():
+        shutil.rmtree(slim_dir)
+    _ensure_dir(slim_dir)
+
+    obj = torch.load(slim_ckpt, map_location="cpu", weights_only=False)
+
+    if isinstance(obj, nn.Module):
+        mdl = obj
+        cfg_slim = getattr(mdl, "config", None) or base_cfg
+        cfg_slim.save_pretrained(slim_dir)
+
+        # Save as HF-style model; this will create config + model weights
+        mdl.save_pretrained(slim_dir, safe_serialization=True)
+
+        # Optionally also drop raw torch model (not strictly needed)
+        # torch.save(mdl, slim_dir / "pytorch_model.bin")
+
+        # We *do not* need additional custom code if everything is pure HF;
+        # but if your pruned model still refers to adapter classes, copy them:
+        if include_code:
+            _copy_code_tree(slim_dir, include_code)
+            (slim_dir / "custom_code.py").write_text(
+                "# Marker file so Hub shows 'custom code' banner for slim model.\n",
+                encoding="utf-8",
+            )
+
+        _save_model_card_and_meta(
+            slim_dir,
+            title=repo_slim,
+            task="image-classification",
+            meta={"base_id": base_id, "variant": "slim-export"},
+            include_code=include_code,
+            repo_slim=repo_slim,
+        )
+
+        if push:
+            create_repo(repo_slim, token=token, private=private, exist_ok=True)
+            upload_folder(repo_id=repo_slim, folder_path=str(slim_dir), token=token)
+            print(f"[ok] Pushed slim student → {repo_slim}")
+
+    else:
+        # Fallback: pure state_dict -> we *can't* reconstruct a standard ViT,
+        # so treat it as a custom model that user has to re-wrap manually.
+        slim_dir = Path("hf_export_slim_vit_state_dict")
+        if slim_dir.exists():
+            shutil.rmtree(slim_dir)
+        _ensure_dir(slim_dir)
+
+        base_cfg.save_pretrained(slim_dir)
+        torch.save(obj, slim_dir / "pytorch_model.bin")
+
+        if include_code:
+            _copy_code_tree(slim_dir, include_code)
+            (slim_dir / "custom_code.py").write_text(
+                "# Custom code required to reconstruct the pruned ViT from this state_dict.\n",
+                encoding="utf-8",
+            )
+
+        _save_model_card_and_meta(
+            slim_dir,
+            title=repo_slim,
+            task="image-classification",
+            meta={
+                "base_id": base_id,
+                "variant": "slim-state-dict",
+                "note": "state_dict only; use HAda ViTAdapter.export_pruned-style loader.",
+            },
+            include_code=include_code,
+            repo_slim=repo_slim,
+        )
+
+        if push:
+            create_repo(repo_slim, token=token, private=private, exist_ok=True)
+            upload_folder(repo_id=repo_slim, folder_path=str(slim_dir), token=token)
+            print(f"[ok] Pushed slim state_dict → {repo_slim}")
+
+        
 
 # --- LLaMA export ------------------------------------------------------------
 
@@ -286,7 +527,7 @@ def export_resnet_variants(
 
 def main():
     ap = argparse.ArgumentParser("Export and push student/slim models to Hugging Face")
-    ap.add_argument("--task", choices=["llama", "resnet"], required=True,
+    ap.add_argument("--task", choices=["llama", "vit", "resnet"], required=True,
                     help="Model family: 'llama' (HF causal LM) or 'resnet' (vision)")
     ap.add_argument("--base_id", type=str, required=True,
                     help="Base HF id used for config/tokenizer (llama) or as metadata (resnet)")
@@ -316,6 +557,18 @@ def main():
             include_code=include_code,
             push=push,
         )
+    elif args.task == "vit":
+        export_vit_variants(
+            base_id=args.base_id,
+            student_ckpt=Path(args.student_ckpt),
+            slim_ckpt=Path(args.slim_ckpt),
+            repo_gated=args.repo_gated,
+            repo_slim=args.repo_slim,
+            token=args.token,
+            private=args.private,
+            include_code=include_code,
+            push=push,
+        )        
     else:
         export_resnet_variants(
             base_id=args.base_id,

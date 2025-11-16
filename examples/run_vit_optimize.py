@@ -35,6 +35,7 @@ from core.distill import KDConfig, ClsHead
 from core.export import ExportPolicy as CoreExportPolicy, Rounding as CoreRounding
 from adapters.huggingface.vit import ViTAdapter, ViTGatingConfig, ViTExportPolicy, vit_search_best_export, _encoder_layers
 from data.vision import build_imagenet_like_loaders, VisionDataConfig, _images_from_batch
+from adapters.huggingface.vit import ViTGrid
 
 from core.finetune import FinetuneConfig, finetune_student
 
@@ -233,7 +234,11 @@ def main():
     
         # Run the grid search for the current num_heads
         num_heads = int(student.config.num_attention_heads)
+        grid_cfg = pack["recipe"].get("export", {}).get("search", {})
+        head_grid = tuple(grid_cfg.get("grid_multiple_groups", (2, 4, 8)))   # default fallback
+        ffn_grid  = tuple(grid_cfg.get("ffn_snaps", (1, 8)))            # default fallback        
         img_size = pack["recipe"]["data"]["img_size"]
+
         search = vit_search_best_export(
             student,
             export_fn=ViTAdapter.export_pruned,
@@ -242,8 +247,10 @@ def main():
             batch_shape=(B, 3, img_size, img_size),
             device=pack["device"],
             make_policy=make_vit_policy,
+            grid=ViTGrid(head_multiple_grid=head_grid, ffn_snap_grid=ffn_grid),
         )
-        
+
+
         slim = search.best_model
         print("Best export params:", search.best_params)
         for rec in sorted(search.trials, key=lambda r: r["mean_ms"])[:5]:
@@ -261,13 +268,17 @@ def main():
         print(f"Keep-all: mean={mean_keep:.3f}ms p95={p95_keep:.3f}ms | Slim: mean={mean_slim:.3f}ms p95={p95_slim:.3f}ms | \nSpeedup={(mean_keep-mean_slim)/max(1e-6,mean_keep)*100:.2f}%")
     
         # Save artifacts
-        torch.save(slim, os.path.join(args.outdir, "vit_slim.pth"))
-        torch.save(student, os.path.join(args.outdir, "vit_gated.pth"))
+        torch.save(slim.state_dict(), os.path.join(args.outdir, "vit_slim.pth"))
+        torch.save(student.state_dict(), os.path.join(args.outdir, "vit_gated.pth"))
     
         print(f"Saved pruned model to {os.path.join(args.outdir, 'vit_slim.pth')}")
     
     else:
-        slim = torch.load(args.slim, map_location=device, weights_only=False).to(device)
+        # slim_weights = torch.load(args.slim, map_location=device, weights_only=False)
+        # missing, unexpected = student.load_state_dict(slim_weights, strict=False)
+        # print("[load] gated missing:", missing)
+        # print("[load] gated unexpected:", unexpected)    
+        slim = torch.load(args.slim, map_location=device, weights_only=False)
         print(f"Skipping training. Pruned model loaded from {args.slim}. [To run with training, drop '--slim' argument]")
 
     if args.finetune is True:
