@@ -28,6 +28,7 @@ from adapters.huggingface.llama import (
     LlamaAdapter,
     LlamaGatingConfig,
     LlamaExportPolicy,
+    LatencyProxyLLM
 )
 from data.llms import build_llm_dataloaders_from_cfg
 
@@ -38,7 +39,6 @@ from core.train import LagrangeTrainer, TrainerConfig, DualConfig
 from core.distill import KDConfig
 from core.gates import PenaltyWeights, Constraints
 from core.export import Rounding as CoreRounding
-from core.proxy_cost import LatencyProxyLLM
 from core.measure import measure_latency_text_ms  # (B,S,T)-aware timing
 
 # HF
