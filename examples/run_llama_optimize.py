@@ -21,6 +21,10 @@ import yaml
 # Make repo root importable
 sys.path.append(str(Path(__file__).resolve().parent))
 
+import os
+
+
+
 # ------------------------
 # Adapter & Data
 # ------------------------
@@ -28,6 +32,7 @@ from adapters.huggingface.llama import (
     LlamaAdapter,
     LlamaGatingConfig,
     LlamaExportPolicy,
+    LatencyProxyLLM
 )
 from data.llms import build_llm_dataloaders_from_cfg
 
@@ -38,11 +43,11 @@ from core.train import LagrangeTrainer, TrainerConfig, DualConfig
 from core.distill import KDConfig
 from core.gates import PenaltyWeights, Constraints
 from core.export import Rounding as CoreRounding
-from core.proxy_cost import LatencyProxyLLM
-from core.measure import measure_latency_text_ms  # (B,S,T)-aware timing
+from core.profiler import measure_latency_text_ms  # (B,S,T)-aware timing
 
 # HF
 from transformers import AutoModelForCausalLM
+
 
 
 # ------------------------
@@ -92,6 +97,7 @@ class _ProxyBridge:
     def __init__(self, inner_llm_proxy: LatencyProxyLLM, decode_T: int):
         self.inner = inner_llm_proxy
         self.decode_T = int(decode_T)
+        self.scale_ms = inner_llm_proxy.scale_ms
 
     def predict(self, model, batch):
         ids, _ = _ids_mask(batch)
@@ -193,9 +199,7 @@ def main():
 
     # -------- latency proxy (bridge to generic interface) --------
     lat_cfg = cfg.get("latency", {})
-    target_ms = float(lat_cfg.get("target_ms", 0.85))
     decode_T = int(lat_cfg.get("decode_T_tokens", 128))
-    real_every = args.real_every if args.real_every is not None else int(lat_cfg.get("real_every", 0))
 
     llm_proxy = LatencyProxyLLM(gate_kv_in_proxy=bool(lat_cfg.get("proxy_gate_kv", False)))
     proxy = _ProxyBridge(llm_proxy, decode_T=decode_T)
@@ -205,12 +209,17 @@ def main():
 
     # Eval policy used during training/probes (permissive)
     policy_eval = LlamaExportPolicy(
-        warmup_steps=int(lat_cfg.get("proxy_warmup_steps", 5)),
+        warmup_steps=0,
         head_rounding=CoreRounding(
-            floor_groups=int(export_cfg.get("q_head_floor_post", 1)),
-            multiple_groups=int(export_cfg.get("q_head_multiple_post", 1)),
+            floor_groups=1,
+            multiple_groups=1,
             min_keep_ratio=float(export_cfg.get("head_min_keep_ratio_post", 0.0)),
         ),
+        q_rounding=CoreRounding(
+            floor_groups=int(export_cfg.get("q",{}).get("floor", 1)),
+            multiple_groups=int(export_cfg.get("q",{}).get("multiple", 1)),
+            min_keep_ratio=float(export_cfg.get("q",{}).get("min_keep_ratio", 0.0)),
+        ),          
         ffn_rounding=CoreRounding(
             floor_groups=1,
             multiple_groups=int(export_cfg.get("ffn_snap_groups_post", 1)),
@@ -220,56 +229,66 @@ def main():
 
     # Final export policy after training (stricter + kernel-friendly)
     export_policy_final = LlamaExportPolicy(
-        warmup_steps=int(export_cfg.get("warmup_steps", 0)),
+        warmup_steps=int(export_cfg.get("warmup_steps", 5)),
         head_rounding=CoreRounding(
-            floor_groups=int(export_cfg.get("q_head_floor_post", 4)),
-            multiple_groups=int(export_cfg.get("q_head_multiple_post", 8)),
-            min_keep_ratio=float(export_cfg.get("head_min_keep_ratio_post", 0.0)),
+            floor_groups=int(export_cfg.get("heads",{}).get("floor", 4)),
+            multiple_groups=int(export_cfg.get("heads",{}).get("multiple", 8)),
+            min_keep_ratio=float(export_cfg.get("heads",{}).get("min_keep_ratio", 0.5)),
         ),
+        q_rounding=CoreRounding(
+            floor_groups=int(export_cfg.get("q",{}).get("floor", 4)),
+            multiple_groups=int(export_cfg.get("q",{}).get("multiple", 8)),
+            min_keep_ratio=float(export_cfg.get("q",{}).get("min_keep_ratio", 0.5)),
+        ),        
         ffn_rounding=CoreRounding(
-            floor_groups=1,
-            multiple_groups=int(export_cfg.get("ffn_snap_groups_post", 128)),
-            min_keep_ratio=float(export_cfg.get("ffn_min_keep_ratio_post", 0.5)),
+            floor_groups=int(export_cfg.get("ffn",{}).get("floor", 1)),
+            multiple_groups=int(export_cfg.get("ffn",{}).get("multiple", 128)),
+            min_keep_ratio=float(export_cfg.get("ffn",{}).get("min_keep_ratio", 0.5)),
         ),
     )
 
-    # -------- optional proxy calibration (keep-all) --------
-    if args.calibrate_proxy:
-        batch = next(iter(train_loader))
-        ids, _ = _ids_mask(batch)
-        B, S = int(ids.size(0)), int(ids.size(1))
+    # Proxy calibration
+    batch = next(iter(train_loader))
+    ids, _ = _ids_mask(batch)
+    B, S = int(ids.size(0)), int(ids.size(1))
 
-        # measure real keep-all
-        slim_keepall = adapter.export_keepall(student).to(device).eval()
-        real_ms, _ = measure_latency_text_ms(slim_keepall, B=B, S=S, T=decode_T, device=device)
-        del slim_keepall
+    # measure real keep-all
+    slim_keepall = adapter.export_keepall(student).to(device).eval()
+    real_ms, _ = measure_latency_text_ms(slim_keepall, B=B, S=S, T=decode_T, device=device)
+    del slim_keepall
 
-        # proxy's raw keep-all prediction (pre-scale)
-        raw_pred = llm_proxy.predict(student, B=B, S=S, T=decode_T)
-        raw_pred = float(raw_pred.detach().item() if hasattr(raw_pred, "detach") else raw_pred)
-        raw_pred = max(raw_pred, 1e-9)
+    # proxy's raw keep-all prediction (pre-scale)
+    raw_pred = llm_proxy.predict(student, B=B, S=S, T=decode_T)
+    raw_pred = float(raw_pred.detach().item() if hasattr(raw_pred, "detach") else raw_pred)
+    raw_pred = max(raw_pred, 1e-9)
 
-        llm_proxy.scale_ms = max(1e-9, float(real_ms) / raw_pred)
-        print(f"[calib] keep-all measured ≈ {real_ms:.3f} ms; proxy.scale_ms set to {llm_proxy.scale_ms:.6f}")
+    llm_proxy.scale_ms = max(1e-9, float(real_ms) / raw_pred)
+    print(f"[calib] keep-all measured ≈ {real_ms:.3f} ms; proxy.scale_ms set to {llm_proxy.scale_ms:.6e}")
+
+
 
     # -------- training knobs --------
-    tr_cfg = cfg.get("train", {})
+    tr_cfg = cfg.get("trainer", {})
     epochs = args.epochs if args.epochs is not None else int(tr_cfg.get("epochs", 1))
     amp_choice = args.amp
     use_amp = (amp_choice != "off")
+    real_every = float(tr_cfg.get("lagrange",{}).get("real_every", 50))
+
+    tau_target_scale = float(tr_cfg.get("trainer",{}).get("lagrange",{}).get("tau_target_scale", 0.7))
+    target_ms = real_ms * tau_target_scale
 
     kd_cfg = KDConfig(
-        temperature=float(tr_cfg.get("kd_T", 2.0)),
-        alpha=float(tr_cfg.get("kd_alpha", 1.0)),
+        temperature=float(tr_cfg.get("kd",{}).get("temperature", 4.0)),
+        alpha=float(tr_cfg.get("kd",{}).get("alpha", 2.0)),
     )
     penalties = PenaltyWeights(
-        l0=float(tr_cfg.get("sparsity_reg", 1e-4)),
-        keep_floor_ratio=float(tr_cfg.get("min_keep_ratio", 0.25)),
-        bimodality=float(tr_cfg.get("bimodality_reg", 1e-6)),
+        l0=float(tr_cfg.get("penalties",{}).get("l0", 1e-4)),
+        keep_floor_ratio=float(tr_cfg.get("penalties",{}).get("keep_floor_ratio", 0.25)),
+        bimodality=float(tr_cfg.get("penalties",{}).get("bimodality", 1e-6)),
     )
     constraints = Constraints(
-        min_keep_ratio=float(tr_cfg.get("min_keep_ratio", 0.25)),
-        min_groups=int(tr_cfg.get("min_groups", 1)),
+        min_keep_ratio=float(tr_cfg.get("constraints",{}).get("min_keep_ratio", 0.25)),
+        min_groups=float(tr_cfg.get("constraints",{}).get("min_groups", 0.25)),
         max_groups_drop=None,
     )
     trainer_cfg = TrainerConfig(
@@ -278,15 +297,16 @@ def main():
         constraints=constraints,
         latency_target_ms=target_ms,
         real_probe_every=real_every,
-        probe_batch_override=None,
+        probe_batch_override=tr_cfg.get("probe_batch_override", None),
         amp=use_amp,
         device=device,
-        lr_gate=float(tr_cfg.get("gate_lr", 5e-2)),
-        lr_linear=float(tr_cfg.get("weight_lr", 1e-4)),
-        lr_affine=float(tr_cfg.get("affine_lr", 3e-4)),
-        wd_linear=float(tr_cfg.get("weight_decay", 1e-4)),
-        use_grad_scaler=True,
-        dual=DualConfig(lr=float(tr_cfg.get("lambda_lr", 0.05)), ema_beta=0.5, clip=10.0),
+        mse_weight=float(tr_cfg.get("mse_weight", 0.1)),
+        lr_gate=float(tr_cfg.get("lagrange",{}).get("gate_lr", 5e-2)),
+        lr_linear=float(tr_cfg.get("lagrange",{}).get("lr_linear", 1e-4)),
+        lr_affine=float(tr_cfg.get("lagrange",{}).get("lr_affine", 3e-4)),
+        wd_linear=float(tr_cfg.get("lagrange",{}).get("wd_linear", 1e-4)),
+        use_grad_scaler=False,
+        dual=DualConfig(lr=float(tr_cfg.get("lagrange",{}).get("lambda_lr", 0.05)), ema_beta=0.5, clip=10.0),
     )
 
     # -------- trainer (family-agnostic, with adapter callables) --------
@@ -310,8 +330,8 @@ def main():
         proxy=proxy,
         adapter_get_student_logits=get_s,
         adapter_get_teacher_logits=get_t,
-        adapter_export_keepall=LlamaAdapter.export_keepall,
-        adapter_export_pruned=LlamaAdapter.export_pruned,
+        adapter_export_keepall=adapter.export_keepall, #LlamaAdapter.export_keepall,
+        adapter_export_pruned=adapter.export_pruned,   #LlamaAdapter.export_pruned,
         export_policy=policy_eval,   # warmup/permissive during training & probes
         cfg=trainer_cfg,             # <<< single source of optimizer/loss/dual params
     )
