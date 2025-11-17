@@ -28,12 +28,11 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 # Local imports (run from repo root)
 from core.utils import set_seed
-from core.proxy_cost import ViTLatencyProxy, ViTProxyConfig
 from core.profiler import measure_latency_ms, ProfileSettings
 from core.train import LagrangeTrainer, TrainerConfig
 from core.distill import KDConfig, ClsHead
 from core.export import ExportPolicy as CoreExportPolicy, Rounding as CoreRounding
-from adapters.huggingface.vit import ViTAdapter, ViTGatingConfig, ViTExportPolicy, vit_search_best_export, _encoder_layers
+from adapters.huggingface.vit import ViTAdapter, ViTGatingConfig, ViTLatencyProxy, ViTProxyConfig, ViTExportPolicy, vit_search_best_export, _encoder_layers
 from data.vision import build_imagenet_like_loaders, VisionDataConfig, _images_from_batch
 from adapters.huggingface.vit import ViTGrid
 
