@@ -22,9 +22,8 @@ from typing import Any, Dict, Sequence
 import torch
 import torch.nn as nn
 
-from adapters.torchvision.resnet import ResNetAdapter, ResNetExportPolicy
+from adapters.torchvision.resnet import ResNetAdapter, ResNetExportPolicy, ResNetProxyConfig, ResNetLatencyProxy
 from core.export import Rounding as CoreRounding
-from core.proxy_cost import ResNetLatencyProxy
 from core.profiler import measure_latency_ms
 from core.train import LagrangeTrainer, TrainerConfig
 from core.distill import KDConfig

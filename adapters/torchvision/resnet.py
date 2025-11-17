@@ -374,3 +374,134 @@ class ResNetAdapter:
             {"params": bn_affine, "lr": 3e-4, "weight_decay": 0.0},
             {"params": fc,        "lr": 5e-4, "weight_decay": 1e-4},
         ]
+
+
+
+
+# ------------------------------ ResNet Proxy ------------------------------
+
+@dataclass
+class ResNetProxyConfig:
+    scale_ms: float = 1.0
+    alpha_conv: float = 1.0   # weight for conv FLOPs term
+
+
+class ResNetLatencyProxy(LatencyProxy):
+    """Latency proxy for ResNet-like backbones with BN gates.
+
+    Approximates latency with a FLOPs-style sum over convs, using the *expected*
+    kept channels after each BN gate (probs.sum()*group_size). Falls back to the
+    full channel count when a gate is not found.
+
+    Accepts a batch or an explicit (N,C,H,W) shape.
+    """
+
+    def __init__(self, cfg: Optional[ResNetProxyConfig] = None):
+        super().__init__()
+        self.cfg = cfg or ResNetProxyConfig()
+
+    @staticmethod
+    def _as_const_like_resnet(x_like: torch.Tensor, val):
+        return torch.as_tensor(val, device=x_like.device, dtype=x_like.dtype)
+
+    @staticmethod
+    def _find_anchor_param(model: nn.Module) -> torch.Tensor:
+        # Prefer any gate-like parameter; otherwise any parameter; else cpu scalar
+        for m in model.modules():
+            for nm in ("logits", "head_gate"):
+                t = getattr(m, nm, None)
+                if isinstance(t, torch.Tensor):
+                    return t
+        for p in model.parameters():
+            return p
+        return torch.tensor(0.0)
+
+    @staticmethod
+    def _kept_from_gate(module, anchor: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return expected kept channels for a BN gate: probs.sum() * group_size.
+        If no gate is found, return None.
+        """
+        g = None
+        for nm in ("gate", "neuron_gate", "channel_gate", "bn_gate"):
+            if hasattr(module, nm):
+                g = getattr(module, nm)
+                break
+        if g is None and hasattr(module, "logits") and hasattr(module, "tau"):
+            g = module
+
+        if g is None or not hasattr(g, "logits"):
+            return None
+        logits = g.logits
+        tau = float(getattr(g, "tau", 1.5))
+        group = int(getattr(g, "group", getattr(g, "group_size", 1)))
+        if group <= 0: group = 1
+        probs = torch.sigmoid(logits / tau)
+        return probs.sum() * _as_const_like_resnet(anchor, group)
+
+    def _add_cost(self, cost_like: torch.Tensor, oc, ic, k, stride, H, W):
+        alpha = _as_const_like_resnet(cost_like, self.cfg.alpha_conv)
+        # update spatial dims with conv stride (roughly, ignoring padding effects)
+        H = (H + stride - 1) // stride
+        W = (W + stride - 1) // stride
+        flops = _as_const_like_resnet(cost_like, oc) * _as_const_like_resnet(cost_like, ic) * (k * k) * _as_const_like_resnet(cost_like, H) * _as_const_like_resnet(cost_like, W)
+        return cost_like + alpha * flops, H, W
+
+    def _predict_raw(self, model: nn.Module, sample: TensorOrBatch, **_) -> torch.Tensor:
+        N, C_in, H0, W0 = _nchw_from_batch(sample)
+        anchor = _find_anchor_param(model)
+        cost = _as_const_like_resnet(anchor, 0.0)
+        H = _as_const_like_resnet(anchor, int(H0))
+        W = _as_const_like_resnet(anchor, int(W0))
+
+        # Stem
+        conv1 = getattr(model, "conv1")
+        bn1 = getattr(model, "bn1", None)
+        k = conv1.kernel_size[0]
+        s = conv1.stride[0]
+        kept_out = None
+        if bn1 is not None:
+            kept = _kept_from_gate(bn1, anchor)
+            if kept is not None:
+                kept_out = kept
+        oc_eff = kept_out if kept_out is not None else _as_const_like_resnet(anchor, conv1.out_channels)
+        cost, H, W = self._add_cost(cost, oc_eff, _as_const_like_resnet(anchor, C_in), k, s, H, W)
+        in_ch = oc_eff
+
+        def _block_cost(block, in_ch, H, W, cost):
+            # conv1 -> bn1
+            c1 = block.conv1
+            b1 = block.bn1 if hasattr(block, "bn1") else None
+            k1, s1 = c1.kernel_size[0], c1.stride[0]
+            oc1_eff = _kept_from_gate(b1, anchor) or _as_const_like_resnet(anchor, c1.out_channels)
+            cost, H, W = self._add_cost(cost, oc1_eff, in_ch, k1, s1, H, W)
+
+            # conv2 -> bn2
+            c2 = block.conv2
+            b2 = block.bn2 if hasattr(block, "bn2") else None
+            k2, s2 = c2.kernel_size[0], c2.stride[0]
+            oc2_eff = _kept_from_gate(b2, anchor) or _as_const_like_resnet(anchor, c2.out_channels)
+            cost, H, W = self._add_cost(cost, oc2_eff, oc1_eff, k2, s2, H, W)
+
+            return oc2_eff, H, W, cost
+
+        # Layers
+        for lname in ("layer1", "layer2", "layer3", "layer4"):
+            layer = getattr(model, lname, None)
+            if layer is None:
+                continue
+            for blk in layer:
+                in_ch, H, W, cost = _block_cost(blk, in_ch, H, W, cost)
+
+        scale = _as_const_like_resnet(anchor, self.cfg.scale_ms)
+        return cost * scale
+
+    @torch.no_grad()
+    def calibrate(self, model: nn.Module, keepall_export_fn, profiler_fn, sample: TensorOrBatch, device: str = "cuda") -> float:
+        """Calibrate `scale_ms` so proxy(model_keepall) ~= real latency in ms."""
+        keep = keepall_export_fn(model)
+        sample_shape = _nchw_from_batch(sample)
+        mean_ms, _ = profiler_fn(keep, sample_shape, device=device)
+        soft = float(self.predict(model, sample).detach().cpu())
+        self.cfg.scale_ms = mean_ms / max(soft, 1e-9)
+        return mean_ms
+
