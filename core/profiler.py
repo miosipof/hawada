@@ -23,10 +23,11 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 import contextlib
 import math
 import time
+import copy
 
 import torch
 import torch.nn as nn
-
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # Settings
@@ -165,7 +166,9 @@ def measure_latency_ms(
         mean_ms = sum(times) / max(1, len(times))
         p = _percentiles(times, cfg.percentile)
         p95 = p.get(95, times[int(0.95 * (len(times) - 1))] if times else float("nan"))
-        return mean_ms, p95
+        std = np.std(times)
+        
+        return mean_ms, p95, std
 
 
 # Higher level wrapper returning multiple percentiles
@@ -234,3 +237,115 @@ def profile_many_shapes(
     for shp in shapes:
         out[tuple(shp)] = profile(model, shp, settings=settings, device=device, forward_fn=forward_fn)
     return out
+
+
+
+@torch.inference_mode()
+def measure_latency_text_ms(
+    model,
+    *,
+    B: int = 4,                   # batch size
+    S: int = 1024,                # prompt length (prefill)
+    T: int = 128,                 # decode steps (cached)
+    vocab_size: Optional[int] = None,   # if None, infer from model.get_input_embeddings()
+    pad_token_id: Optional[int] = None,
+    eos_token_id: Optional[int] = None,
+    warmup: int = 10,
+    iters: int = 30,
+    device: str = "cuda",
+) -> Tuple[float, float]:
+    """
+    Measure end-to-end LLM latency (prefill + cached decode) in milliseconds.
+
+    Procedure per iteration:
+      1) Prefill once on random tokens, building KV cache
+      2) Decode for T steps with use_cache=True (feeding last token)
+
+    Returns:
+      (mean_ms, p95_ms) across `iters`.
+
+    Notes:
+      * Uses CUDA events if CUDA is available and device starts with "cuda", else perf_counter.
+      * Random token IDs are sampled in [100, vocab_size) to avoid special IDs by default.
+      * Assumes Hugging Face-style causal LM forward signature returning `logits` and `past_key_values`.
+    """
+    # --------- prepare model & vocab size ----------
+    m = copy.deepcopy(model).to(device).eval()
+
+    if vocab_size is None:
+        emb = m.get_input_embeddings() if hasattr(m, "get_input_embeddings") else None
+        if emb is None:
+            raise ValueError(
+                "Provide `vocab_size` or ensure `model.get_input_embeddings()` exists."
+            )
+        vocab_size = int(emb.num_embeddings)
+
+    # basic token ids (best-effort defaults)
+    if pad_token_id is None:
+        pad_token_id = getattr(getattr(m, "config", object()), "pad_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = getattr(getattr(m, "config", object()), "eos_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = eos_token_id if eos_token_id is not None else 0
+
+    # --------- tensor builders ----------
+    def _rand_ids(b: int, s: int) -> torch.Tensor:
+        # bias away from very low IDs to reduce chance of hitting specials
+        return torch.randint(100, vocab_size, (b, s), device=device, dtype=torch.long)
+
+    def _attention_mask_like(ids: torch.Tensor) -> torch.Tensor:
+        # standard all-ones mask
+        return torch.ones_like(ids, dtype=torch.long, device=ids.device)
+
+    # --------- one full pass (prefill + decode T) ----------
+    def _one_pass() -> None:
+        # Prefill
+        input_ids = _rand_ids(B, S)
+        attn_mask = _attention_mask_like(input_ids)
+        out = m(input_ids=input_ids, attention_mask=attn_mask, use_cache=True, return_dict=True)
+        past = getattr(out, "past_key_values", None)
+
+        # Decode loop (feed last token, update cache)
+        next_ids = input_ids[:, -1:]
+        for _ in range(T):
+            out = m(input_ids=next_ids, attention_mask=None, use_cache=True, past_key_values=past, return_dict=True)
+            past = getattr(out, "past_key_values", None)
+            # greedy next token purely to exercise logits→ids on-device
+            logits = out.logits[:, -1, :]          # [B, V]
+            next_ids = torch.argmax(logits, dim=-1, keepdim=True)  # [B,1]
+
+    # --------- warmup ----------
+    use_cuda_timer = (torch.cuda.is_available() and str(device).startswith("cuda"))
+    if use_cuda_timer:
+        torch.cuda.synchronize()
+        for _ in range(int(warmup)):
+            _one_pass()
+        torch.cuda.synchronize()
+    else:
+        for _ in range(int(warmup)):
+            _one_pass()
+
+    # --------- timed runs ----------
+    times_ms = []
+    if use_cuda_timer:
+        for _ in range(int(iters)):
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            t0.record()
+            _one_pass()
+            t1.record()
+            torch.cuda.synchronize()
+            times_ms.append(t0.elapsed_time(t1))  # milliseconds
+    else:
+        for _ in range(int(iters)):
+            t0 = time.perf_counter()
+            _one_pass()
+            t1 = time.perf_counter()
+            times_ms.append((t1 - t0) * 1000.0)
+
+    times_ms.sort()
+    mean_ms = sum(times_ms) / len(times_ms)
+    p95_ms = times_ms[max(0, int(0.95 * len(times_ms)) - 1)]
+    std = np.std(times_ms)
+    return mean_ms, p95_ms, std

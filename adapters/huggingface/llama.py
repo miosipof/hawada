@@ -24,6 +24,9 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Callable, Tuple
 
 import copy
+from copy import deepcopy
+from typing import Optional
+
 import math
 import torch
 import torch.nn as nn
@@ -39,6 +42,7 @@ from core.export import (
 )
 from core.utils import deepcopy_eval_cpu
 from core.search_export import grid_search_latency
+from core.proxy_cost import LatencyProxy
 
 # -------------------------------------------------------------------------
 # Configs
@@ -406,117 +410,230 @@ class LlamaAdapter:
                 delattr(mlp, "neuron_gate")
 
         return slim
-
+    
     @staticmethod
     @torch.no_grad()
     def export_pruned(model_with_gates: nn.Module, policy, step: int) -> nn.Module:
         """
         Produce a clean CPU eval model:
-          - Read gates to choose Q heads; slice q_proj rows and o_proj cols
-          - Snap kept heads to an LCM of (policy multiple, Hkv)
-          - Slice SwiGLU up/gate/down by groups
-          - Unwrap back to plain HF modules; update metadata
+    
+          - Attention:
+            * Read per-head gates, rank heads.
+            * Choose H_keep heads with rounding/constraints.
+            * Slice q_proj rows and o_proj cols.
+            * Keep k_proj / v_proj (GQA) but update num_heads / num_key_value_groups.
+    
+          - MLP:
+            * Read GroupGate over SwiGLU expansion.
+            * Choose kept groups with rounding/constraints.
+            * Slice up_proj/gate_proj (out) and down_proj (in).
+            * Restore original forward, drop gates.
+    
+        Does NOT touch:
+          - hidden_size / embeddings / norms / lm_head.
         """
-        # Accept either CoreExportPolicy with per-axis rounding or family policy
+    
+        # -------------------------------------------------------------------------
+        # Unpack policy
+        # -------------------------------------------------------------------------
+    
         if isinstance(policy, LlamaExportPolicy):
-            head_rounding = policy.head_rounding
-            ffn_rounding = policy.ffn_rounding
-            warmup_steps = policy.warmup_steps
+            head_rounding = policy.head_rounding   # has: floor_groups, multiple_groups, min_keep_ratio
+            ffn_rounding  = policy.ffn_rounding
+            q_rounding    = getattr(policy, "q_rounding", None)  # currently unused, kept for future
+            warmup_steps  = int(policy.warmup_steps)
         else:
             head_rounding = getattr(policy, "rounding", None)
-            ffn_rounding = getattr(policy, "rounding", None)
-            warmup_steps = int(getattr(policy, "warmup_steps", 0))
-
+            ffn_rounding  = getattr(policy, "rounding", None)
+            q_rounding    = None
+            warmup_steps  = int(getattr(policy, "warmup_steps", 0))
+    
+        # Safety defaults if rounding is None
+        class _DefaultRound:
+            def __init__(self):
+                self.floor_groups = 1
+                self.multiple_groups = 1
+                self.min_keep_ratio = 0.0
+    
+        if head_rounding is None:
+            head_rounding = _DefaultRound()
+        if ffn_rounding is None:
+            ffn_rounding = _DefaultRound()
+    
+        warm = (step < warmup_steps)
+    
+        # -------------------------------------------------------------------------
+        # Clone model to CPU + eval
+        # -------------------------------------------------------------------------
+        def deepcopy_eval_cpu(m: nn.Module) -> nn.Module:
+            m = deepcopy(m)
+            m.eval()
+            return m.cpu()
+    
         slim = deepcopy_eval_cpu(model_with_gates)
         core = getattr(slim, "model", slim)
         layers = getattr(core, "layers", None)
         if layers is None:
             return slim
-
-        warm = (step < warmup_steps)
-
-        def _lcm(a: int, b: int) -> int:
-            return abs(a * b) // math.gcd(max(a, 1), max(b, 1)) if a > 0 and b > 0 else max(a, b, 1)
-
+        
+        # -------------------------------------------------------------------------
+        # Helpers
+        # -------------------------------------------------------------------------
+        def _snap_heads(Hq: int, raw_keep: int, Hkv: int, cfg) -> int:
+            """
+            Snap number of kept heads to something compatible with:
+              - min_keep_ratio
+              - floor_groups
+              - multiple_groups
+              - GQA constraint (multiple of Hkv).
+            """
+            # minimum allowed heads from ratio / floor
+            min_by_ratio = int(math.ceil(cfg.min_keep_ratio * Hq))
+            min_by_floor = int(cfg.floor_groups)
+            min_keep = max(min_by_ratio, min_by_floor, Hkv)  # must have at least one KV-group
+    
+            # base step in heads: must be multiple of Hkv
+            step = int(cfg.multiple_groups)
+            if step < Hkv:
+                # we must respect GQA: groups = H_keep / Hkv must be integer
+                step = Hkv
+    
+            raw_keep = max(min_keep, min(raw_keep, Hq))
+            snapped = (raw_keep // step) * step
+            if snapped < min_keep:
+                snapped = min_keep
+            if snapped > Hq:
+                snapped = Hq
+    
+            # final guard: GQA groups integer
+            if snapped % Hkv != 0:
+                snapped = (snapped // Hkv) * Hkv
+                snapped = max(min_keep, min(snapped, Hq))
+    
+            return snapped
+    
+        def _snap_groups(G: int, raw_keep: int, cfg) -> int:
+            """
+            Snap number of kept FFN groups.
+            """
+            min_by_ratio = int(math.ceil(cfg.min_keep_ratio * G))
+            min_by_floor = int(cfg.floor_groups)
+            min_keep = max(1, min_by_ratio, min_by_floor)
+    
+            step = max(1, int(cfg.multiple_groups))
+    
+            raw_keep = max(min_keep, min(raw_keep, G))
+            snapped = (raw_keep // step) * step
+            if snapped < min_keep:
+                snapped = min_keep
+            if snapped > G:
+                snapped = G
+            return snapped
+    
+        def _normalize_scores(x: torch.Tensor) -> torch.Tensor:
+            """
+            Normalize logits for stable ranking (optional but helps when range is tiny).
+            """
+            if x.numel() == 0:
+                return x
+            mean = x.mean()
+            std = x.std()
+            if float(std) < 1e-6:
+                return x - mean
+            return (x - mean) / std
+    
+        # -------------------------------------------------------------------------
+        # Main loop over layers
+        # -------------------------------------------------------------------------
         for li, layer in enumerate(layers):
-            # ---- Attention (Q heads) ----
+            # ====================== ATTENTION PRUNING ============================
             attn = layer.self_attn
+    
             if isinstance(attn, GatedSelfAttentionLLM):
                 gat = attn
                 base = gat.base_attn
-
+    
                 Hq  = int(gat.num_q_heads)
                 Hkv = int(gat.num_kv_heads)
                 Dh  = int(gat.head_dim)
-
+    
                 if warm:
+                    # keep all heads during warmup
                     keep_idx = torch.arange(Hq)
                 else:
-                    # Build a "per-head" proxy gate if base gate is per-channel.
                     base_logits = gat.head_gate.logits.detach().float().view(-1)
-                    tau = float(getattr(gat.head_gate, "tau", 1.0))
-
+    
+                    # per-head vs per-channel gate
                     if base_logits.numel() == Hq:
-                        # Native per-head gate: use as-is
+                        # per-head gate
                         proxy_gate = gat.head_gate
-                        keep_idx = keep_group_indices_from_gate(
+                        raw_keep_idx = keep_group_indices_from_gate(
                             proxy_gate, policy=policy, step=step, custom_rounding=head_rounding
                         )
+                        # use logits directly as scores
+                        scores = base_logits
                     elif base_logits.numel() == Hq * Dh:
-                        # Collapse per-channel → per-head (mean; or use .amax for stricter)
+                        # per-channel gate → average to per-head
                         per_head_logits = base_logits.view(Hq, Dh).mean(dim=1)
-
+    
                         class _PerHeadProxyGate:
                             def __init__(self, logits, tau):
                                 self.logits = logits
                                 self.tau = tau
                                 self.num_groups = logits.numel()
                                 self.group_size = 1
-
-                        proxy_gate = _PerHeadProxyGate(per_head_logits, tau)
-                        keep_idx = keep_group_indices_from_gate(
+    
+                        proxy_gate = _PerHeadProxyGate(per_head_logits, float(getattr(gat.head_gate, "tau", 1.0)))
+                        raw_keep_idx = keep_group_indices_from_gate(
                             proxy_gate, policy=policy, step=step, custom_rounding=head_rounding
                         )
+                        scores = per_head_logits
                     else:
                         raise RuntimeError(
-                            f"Unexpected HeadGate logits len {base_logits.numel()} vs H={Hq} or H*Dh={Hq*Dh}"
+                            f"[export_pruned] Unexpected HeadGate logits len {base_logits.numel()} "
+                            f"vs H={Hq} or H*Dh={Hq*Dh}"
                         )
-
-                    # Enforce LCM with GQA (Hkv) via truncation to floor-multiple
-                    def _lcm(a: int, b: int) -> int:
-                        import math
-                        return abs(a * b) // math.gcd(max(a, 1), max(b, 1)) if a > 0 and b > 0 else max(a, b, 1)
-
-                    pol_mult = getattr(head_rounding, "multiple_groups", 1)
-                    snap = _lcm(int(pol_mult), max(1, Hkv))
-                    if keep_idx.numel() % snap != 0:
-                        k = (keep_idx.numel() // snap) * snap
-                        k = max(snap, min(Hq, k))
-                        # recompute top-k by per-head logits (ensure same criterion used above)
-                        if base_logits.numel() == Hq * Dh:
-                            scores = per_head_logits
-                        else:
-                            scores = base_logits
-                        keep_idx = torch.topk(scores, k=k, largest=True).indices.sort().values
-
-
+    
+                    # If gate helper returns everything, we still consider Hq as raw_keep
+                    raw_keep = int(raw_keep_idx.numel())
+                    H_keep = _snap_heads(Hq, raw_keep, Hkv, head_rounding)
+    
+                    # Normalize scores for a sharper top-k
+                    scores = _normalize_scores(scores)
+    
+                    # Recompute final keep_idx as top-k by scores
+                    k = int(H_keep)
+                    keep_idx = torch.topk(scores, k=k, largest=True).indices.sort().values
+    
+                    # ---- DEBUG LOGGING (optional) ----
+                    if step % 50 == 0 and li < 16:  # you can tweak this condition
+                        print(
+                            f"[DEBUG L{li}] Hq={Hq}, raw_keep={raw_keep}, snapped={H_keep}, "
+                            f"min_logit={float(scores.min()):.4f}, max_logit={float(scores.max()):.4f}"
+                        )
+    
                 H_keep = int(keep_idx.numel())
+                assert H_keep > 0, f"[export_pruned] H_keep=0 at layer {li}"
+                assert H_keep % Hkv == 0, f"[export_pruned] H_keep={H_keep} not divisible by Hkv={Hkv} at layer {li}"
+    
                 # channels for q/o slicing
-                ch_idx = torch.cat([torch.arange(h * Dh, (h + 1) * Dh) for h in keep_idx]).long()
-
-                # slice wrapper linears
+                ch_idx = torch.cat(
+                    [torch.arange(h * Dh, (h + 1) * Dh, dtype=torch.long) for h in keep_idx]
+                )
+    
+                # slice wrapper linears (q out, o in)
                 gat.q_proj = slice_linear(gat.q_proj, keep_out=ch_idx)
                 gat.o_proj = slice_linear(gat.o_proj, keep_in=ch_idx)
-
+    
                 # transplant into a clean HF attention
-                new_attn = copy.deepcopy(base)
+                new_attn = deepcopy(base)
                 if hasattr(new_attn, "q_proj"):
                     new_attn.q_proj = gat.q_proj
                 if hasattr(new_attn, "o_proj"):
                     new_attn.o_proj = gat.o_proj
                 elif hasattr(new_attn, "out_proj"):
                     new_attn.out_proj = gat.o_proj
-
+    
                 # update metadata
                 if hasattr(new_attn, "num_heads"):
                     new_attn.num_heads = int(H_keep)
@@ -524,32 +641,55 @@ class LlamaAdapter:
                     new_attn.num_key_value_heads = int(Hkv)
                 if hasattr(new_attn, "head_dim"):
                     new_attn.head_dim = int(Dh)
-                if hasattr(core.config, "hidden_size"):
-                    core.config.hidden_size = int(H_keep * Dh)
-
-                layer.self_attn = new_attn  # unwrap
-
-            # ---- MLP (SwiGLU grouped) ----
+                if hasattr(new_attn, "num_key_value_groups"):
+                    new_attn.num_key_value_groups = new_attn.num_heads // new_attn.num_key_value_heads
+    
+                # plug back
+                layer.self_attn = new_attn
+    
+            # ========================= MLP PRUNING ==============================
             mlp = layer.mlp
             g = getattr(mlp, "neuron_gate", None)
             if g is not None:
-                grp_idx = keep_group_indices_from_gate(
-                    g, policy=policy, step=step, custom_rounding=ffn_rounding,
+                # g is GroupGate over expansion dimension (e.g., 64 groups)
+                G = int(g.num_groups)
+                logits = g.logits.detach().float().view(-1)
+                logits = _normalize_scores(logits)
+    
+                raw_grp_idx = keep_group_indices_from_gate(
+                    g, policy=policy, step=step, custom_rounding=ffn_rounding
                 )
-                group = int(g.group_size)  # GroupGate exposes group_size
-                keep_exp = torch.cat([torch.arange(i * group, (i + 1) * group) for i in grp_idx]).long()
-
+                raw_keep_groups = int(raw_grp_idx.numel())
+                keep_groups = _snap_groups(G, raw_keep_groups, ffn_rounding)
+    
+                # final group indices as top-k by normalized logits
+                grp_scores = logits
+                grp_k = int(keep_groups)
+                grp_idx = torch.topk(grp_scores, k=grp_k, largest=True).indices.sort().values
+    
+                group_size = int(g.group_size)
+                keep_exp = torch.cat(
+                    [torch.arange(i * group_size, (i + 1) * group_size, dtype=torch.long) for i in grp_idx]
+                )
+    
+                # slice SwiGLU projections
                 mlp.up_proj   = slice_linear(mlp.up_proj,   keep_out=keep_exp)
                 mlp.gate_proj = slice_linear(mlp.gate_proj, keep_out=keep_exp)
                 mlp.down_proj = slice_linear(mlp.down_proj, keep_in=keep_exp)
-
+    
                 # Restore clean forward & drop gate
                 if hasattr(mlp, "_orig_forward"):
                     mlp.forward = mlp._orig_forward
                     delattr(mlp, "_orig_forward")
                 if hasattr(mlp, "neuron_gate"):
                     delattr(mlp, "neuron_gate")
-
+    
+                # ---- DEBUG LOGGING (optional) ----
+                if step % 50 == 0 and li < 16:
+                    print(
+                        f"[DEBUG L{li}] FFN groups: initial G={G}, raw_keep={raw_keep_groups}, snapped={keep_groups}"
+                    )
+    
         return slim
 
 
@@ -562,6 +702,7 @@ class LlamaExportPolicy:
     warmup_steps: int = 0
     head_rounding: CoreRounding = CoreRounding()  # e.g., CoreRounding(floor=8, multiple=8)
     ffn_rounding:  CoreRounding = CoreRounding()  # e.g., CoreRounding(min_keep_ratio=0.8, multiple=32)
+    q_rounding:    CoreRounding = CoreRounding()
 
 
 # -------------------------------------------------------------------------
@@ -874,57 +1015,58 @@ class LatencyProxyLLM(LatencyProxy):
 # ------------------------------------------------------------
 # Calibration helpers for LLM
 # ------------------------------------------------------------
-@torch.inference_mode()
-def calibrate_proxy_llm(
-    proxy: LatencyProxyLLM,
-    model: nn.Module,
-    *,
-    B: int,
-    S: int,
-    T: int,
-    export_keepall_fn,
-    device: str = "cuda",
-    warmup: int = 10,
-    iters: int = 30,
-) -> float:
-    """
-    Calibrate proxy.scale_ms so proxy.predict(...) matches real keep-all latency for (B,S,T).
-    Returns the measured real mean latency in ms.
-    """
-    keepall = export_keepall_fn(model).to(device).eval()
 
-    # Measure real latency (prefill + decode)
-    from core.measure import measure_latency_text_ms as _measure  # adjust if your path differs
-    real_ms, _ = _measure(keepall, B=B, S=S, T=T, warmup=warmup, iters=iters, device=device)
+# @torch.inference_mode()
+# def calibrate_proxy_llm(
+#     proxy: LatencyProxyLLM,
+#     model: nn.Module,
+#     *,
+#     B: int,
+#     S: int,
+#     T: int,
+#     export_keepall_fn,
+#     device: str = "cuda",
+#     warmup: int = 10,
+#     iters: int = 30,
+# ) -> float:
+#     """
+#     Calibrate proxy.scale_ms so proxy.predict(...) matches real keep-all latency for (B,S,T).
+#     Returns the measured real mean latency in ms.
+#     """
+#     keepall = export_keepall_fn(model).to(device).eval()
 
-    # Soft/proxy latency on *gated* model
-    ms_like = proxy.predict(model, B=B, S=S, T=T)
-    soft_ms = float(ms_like.detach().item()) if torch.is_tensor(ms_like) else float(ms_like)
+#     # Measure real latency (prefill + decode)
+#     from core.measure import measure_latency_text_ms as _measure  # adjust if your path differs
+#     real_ms, _ = _measure(keepall, B=B, S=S, T=T, warmup=warmup, iters=iters, device=device)
 
-    proxy.scale_ms = float(real_ms / max(soft_ms, 1e-9))
-    return real_ms
+#     # Soft/proxy latency on *gated* model
+#     ms_like = proxy.predict(model, B=B, S=S, T=T)
+#     soft_ms = float(ms_like.detach().item()) if torch.is_tensor(ms_like) else float(ms_like)
+
+#     proxy.scale_ms = float(real_ms / max(soft_ms, 1e-9))
+#     return real_ms
 
 
-@torch.inference_mode()
-def calibrate_proxy_llm_from_batch(
-    proxy: LatencyProxyLLM,
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    *,
-    T: int,
-    export_keepall_fn,
-    device: str = "cuda",
-    warmup: int = 10,
-    iters: int = 30,
-) -> Tuple[int, int, int, float]:
-    """
-    Infers (B,S) from a batch like {'input_ids': [B,S], ...},
-    calibrates for (B,S,T), and returns (B,S,T, real_ms).
-    """
-    input_ids = batch["input_ids"]
-    B, S = int(input_ids.size(0)), int(input_ids.size(1))
-    ms = calibrate_proxy_llm(
-        proxy, model, B=B, S=S, T=T, export_keepall_fn=export_keepall_fn,
-        device=device, warmup=warmup, iters=iters
-    )
-    return B, S, T, ms
+# @torch.inference_mode()
+# def calibrate_proxy_llm_from_batch(
+#     proxy: LatencyProxyLLM,
+#     model: nn.Module,
+#     batch: Dict[str, torch.Tensor],
+#     *,
+#     T: int,
+#     export_keepall_fn,
+#     device: str = "cuda",
+#     warmup: int = 10,
+#     iters: int = 30,
+# ) -> Tuple[int, int, int, float]:
+#     """
+#     Infers (B,S) from a batch like {'input_ids': [B,S], ...},
+#     calibrates for (B,S,T), and returns (B,S,T, real_ms).
+#     """
+#     input_ids = batch["input_ids"]
+#     B, S = int(input_ids.size(0)), int(input_ids.size(1))
+#     ms = calibrate_proxy_llm(
+#         proxy, model, B=B, S=S, T=T, export_keepall_fn=export_keepall_fn,
+#         device=device, warmup=warmup, iters=iters
+#     )
+#     return B, S, T, ms

@@ -21,7 +21,6 @@ import yaml
 # Make repo root importable
 sys.path.append(str(Path(__file__).resolve().parent))
 
-import os
 
 
 
@@ -213,17 +212,17 @@ def main():
         head_rounding=CoreRounding(
             floor_groups=1,
             multiple_groups=1,
-            min_keep_ratio=float(export_cfg.get("head_min_keep_ratio_post", 0.0)),
+            min_keep_ratio=0.5,
         ),
         q_rounding=CoreRounding(
-            floor_groups=int(export_cfg.get("q",{}).get("floor", 1)),
-            multiple_groups=int(export_cfg.get("q",{}).get("multiple", 1)),
-            min_keep_ratio=float(export_cfg.get("q",{}).get("min_keep_ratio", 0.0)),
+            floor_groups=1,
+            multiple_groups=1,
+            min_keep_ratio=0.5,
         ),          
         ffn_rounding=CoreRounding(
             floor_groups=1,
-            multiple_groups=int(export_cfg.get("ffn_snap_groups_post", 1)),
-            min_keep_ratio=float(export_cfg.get("ffn_min_keep_ratio_post", 0.0)),
+            multiple_groups=1,
+            min_keep_ratio=0.5,
         ),
     )
 
@@ -254,7 +253,7 @@ def main():
 
     # measure real keep-all
     slim_keepall = adapter.export_keepall(student).to(device).eval()
-    real_ms, _ = measure_latency_text_ms(slim_keepall, B=B, S=S, T=decode_T, device=device)
+    real_ms, _, _ = measure_latency_text_ms(slim_keepall, B=B, S=S, T=decode_T, device=device)
     del slim_keepall
 
     # proxy's raw keep-all prediction (pre-scale)
@@ -367,15 +366,79 @@ def main():
     torch.save(slim.state_dict(), slim_path)
     print(f"[export] saved slim state_dict → {slim_path}")
 
+
+
+import torch
+
+def linear_shape(mod):
+    if mod is None:
+        return None
+    w = mod.weight
+    return tuple(w.shape)
+
+
+def print_llama_layer_info(model, label="MODEL"):
+    """Print Q/K/V/O and FFN sizes for each layer."""
+    core = getattr(model, "model", model)
+    layers = core.layers
+
+    print("=" * 60)
+    print(f" MODEL SHAPE REPORT: {label}")
+    print("=" * 60)
+
+    for i, layer in enumerate(layers):
+        attn = layer.self_attn
+        mlp  = layer.mlp
+
+        print(f"\n---- Layer {i} ----")
+
+        # Attention projections
+        print(f"  Q_proj: {linear_shape(attn.q_proj)}")
+        print(f"  K_proj: {linear_shape(attn.k_proj)}")
+        print(f"  V_proj: {linear_shape(attn.v_proj)}")
+
+        # Depending on HF version, o_proj is either "o_proj" or "out_proj"
+        o_proj = getattr(attn, "o_proj", None)
+        if o_proj is None:
+            o_proj = getattr(attn, "out_proj", None)
+        print(f"  O_proj: {linear_shape(o_proj)}")
+
+        # Metadata
+        print(f"  num_heads:           {attn.num_heads}")
+        if hasattr(attn, "num_key_value_heads"):
+            print(f"  num_kv_heads:        {attn.num_key_value_heads}")
+        if hasattr(attn, "head_dim"):
+            print(f"  head_dim:            {attn.head_dim}")
+
+        # FFN projections (SwiGLU)
+        print(f"  up_proj:   {linear_shape(mlp.up_proj)}")
+        print(f"  gate_proj: {linear_shape(mlp.gate_proj)}")
+        print(f"  down_proj: {linear_shape(mlp.down_proj)}")
+
+    print("\nDone.\n")
+
+
+
+
+
     # optional: measure latency on a real batch
     try:
         batch = next(iter(val_loader))
         ids, _ = _ids_mask(batch)
         B, S = int(ids.size(0)), int(ids.size(1))
-        mean_ms, p95_ms = measure_latency_text_ms(slim.to(device).eval(), B=B, S=S, T=decode_T, device=device)
-        print(f"[latency/slim] mean={mean_ms:.3f} ms p95={p95_ms:.3f} ms  (B={B}, S={S}, T={decode_T})")
+        mean_ms, p95_ms, std = measure_latency_text_ms(slim.to(device).eval(), B=B, S=S, T=decode_T, device=device)
+        print(f"[latency/slim] mean={mean_ms:.3f}ms | p95={p95_ms:.3f}ms | std={std:.3f} | (B={B}, S={S}, T={decode_T})")
     except Exception as e:
         print(f"[latency] skipping measure: {e}")
+
+
+    print_llama_layer_info(slim, label="SLIM MODEL")
+
+    keep = adapter.export_keepall(student)
+    print_llama_layer_info(keep, label="KEEP MODEL")
+
+
+
 
 
 if __name__ == "__main__":

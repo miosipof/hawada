@@ -104,7 +104,12 @@ def keep_group_indices_from_gate(
     if step is not None and step < int(policy.warmup_steps):
         return torch.arange(G, device=gate.logits.device)
 
-    rounding = custom_rounding or policy.rounding
+    if not hasattr(policy, "rounding") or custom_rounding is not None:
+        rounding = custom_rounding
+    else:
+        rounding = policy.rounding
+        
+    
     p = torch.sigmoid(gate.logits.detach().float() / float(gate.tau))
     k = _compute_keep_k(expected_kept=float(p.sum()), total_groups=G, rounding=rounding)
     idx = torch.topk(p, k, largest=True).indices.sort().values
