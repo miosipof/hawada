@@ -31,6 +31,17 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+import os
+import re
+
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+from transformers import PreTrainedModel
+from transformers import AutoConfig
 
 # Core (absolute imports so running `-m examples.run_llama_optimize` works)
 from core.gates import HeadGate, GroupGate
@@ -1013,60 +1024,491 @@ class LatencyProxyLLM(LatencyProxy):
 
 
 # ------------------------------------------------------------
-# Calibration helpers for LLM
+# Wrapper to mimic HF
 # ------------------------------------------------------------
 
-# @torch.inference_mode()
-# def calibrate_proxy_llm(
-#     proxy: LatencyProxyLLM,
-#     model: nn.Module,
-#     *,
-#     B: int,
-#     S: int,
-#     T: int,
-#     export_keepall_fn,
-#     device: str = "cuda",
-#     warmup: int = 10,
-#     iters: int = 30,
-# ) -> float:
-#     """
-#     Calibrate proxy.scale_ms so proxy.predict(...) matches real keep-all latency for (B,S,T).
-#     Returns the measured real mean latency in ms.
-#     """
-#     keepall = export_keepall_fn(model).to(device).eval()
-
-#     # Measure real latency (prefill + decode)
-#     from core.measure import measure_latency_text_ms as _measure  # adjust if your path differs
-#     real_ms, _ = _measure(keepall, B=B, S=S, T=T, warmup=warmup, iters=iters, device=device)
-
-#     # Soft/proxy latency on *gated* model
-#     ms_like = proxy.predict(model, B=B, S=S, T=T)
-#     soft_ms = float(ms_like.detach().item()) if torch.is_tensor(ms_like) else float(ms_like)
-
-#     proxy.scale_ms = float(real_ms / max(soft_ms, 1e-9))
-#     return real_ms
 
 
-# @torch.inference_mode()
-# def calibrate_proxy_llm_from_batch(
-#     proxy: LatencyProxyLLM,
-#     model: nn.Module,
-#     batch: Dict[str, torch.Tensor],
-#     *,
-#     T: int,
-#     export_keepall_fn,
-#     device: str = "cuda",
-#     warmup: int = 10,
-#     iters: int = 30,
-# ) -> Tuple[int, int, int, float]:
-#     """
-#     Infers (B,S) from a batch like {'input_ids': [B,S], ...},
-#     calibrates for (B,S,T), and returns (B,S,T, real_ms).
-#     """
-#     input_ids = batch["input_ids"]
-#     B, S = int(input_ids.size(0)), int(input_ids.size(1))
-#     ms = calibrate_proxy_llm(
-#         proxy, model, B=B, S=S, T=T, export_keepall_fn=export_keepall_fn,
-#         device=device, warmup=warmup, iters=iters
-#     )
-#     return B, S, T, ms
+class SlimLlamaModel(nn.Module):
+    def __init__(self, config: LlamaConfig, layer_meta):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                SlimLlamaDecoderLayer(config, Hq=meta["Hq"], d_ff=meta["d_ff"])
+                for meta in layer_meta
+            ]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        self.rotary_emb = LlamaRotaryEmbedding(
+            dim=config.hidden_size // config.num_attention_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        cache_position=None,
+    ):
+        # Very similar to HF's LlamaModel.forward, but we pass layer_meta-driven modules.
+        if input_ids is None:
+            raise ValueError("input_ids required")
+
+        bsz, seq_len = input_ids.shape
+        hidden_states = self.embed_tokens(input_ids)
+
+        # Build causal mask + attention mask once (you already do this in your profiler)
+        causal_mask = attention_mask  # reuse your existing mask building
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_past_key_values = () if use_cache else None
+
+        # rotary precompute
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            past_kv = past_key_values[layer_idx] if past_key_values is not None else None
+
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_kv,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_past_key_values += (layer_outputs[1],)
+            if output_attentions:
+                all_self_attns += (layer_outputs[-1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        if not return_dict:
+            outputs = (hidden_states,)
+            if use_cache:
+                outputs += (next_past_key_values,)
+            if output_hidden_states:
+                outputs += (all_hidden_states,)
+            if output_attentions:
+                outputs += (all_self_attns,)
+            return outputs
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+
+class SlimLlamaForCausalLM(PreTrainedModel):
+    config_class = LlamaConfig  # reuse
+
+    def __init__(self, config: LlamaConfig, layer_meta):
+        super().__init__(config)
+        self.model = SlimLlamaModel(config, layer_meta)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+        
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, new_emb):
+        self.model.embed_tokens = new_emb
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_lm_head):
+        self.lm_head = new_lm_head
+        
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        labels=None,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        past_key_values=None,
+        cache_position=None,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        else:
+            loss = None
+
+        if not return_dict:
+            out = (logits,) + outputs[1:]
+            return ((loss,) + out) if loss is not None else out
+
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+
+class SlimLlamaSdpaAttention(nn.Module):
+    def __init__(self, config: LlamaConfig, Hq: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads  # 64
+        # num_heads is derived from pruned q size:
+        self.num_heads = Hq // self.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        self.q_proj = nn.Linear(self.hidden_size, Hq, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(Hq, self.hidden_size, bias=False)
+
+        # rotary stays same
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        self.rotary_emb = LlamaRotaryEmbedding(
+            dim=self.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+        self.attention_dropout = config.attention_dropout
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: torch.Tensor | None = None,
+    ):
+        bsz, q_len, _ = hidden_states.size()
+
+        q = self.q_proj(hidden_states)                     # (B, T, Hq)
+        k = self.k_proj(hidden_states)                     # (B, T, n_kv * d)
+        v = self.v_proj(hidden_states)
+
+        # (B, T, n_heads, d)
+        q = q.view(bsz, q_len, self.num_heads, self.head_dim)
+        # (B, T, n_kv, d)
+        k = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # transpose to (B, n_heads, T, d)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # rotary
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(v, position_ids)
+        else:
+            cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # group query attention: repeat kv heads
+        if self.num_key_value_groups > 1:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+
+        # causal_mask = attention_mask  # you already pass combined mask from LlamaModel
+        # if causal_mask is not None and not (
+        #     causal_mask.dtype.is_floating_point or causal_mask.dtype == torch.bool
+        # ):
+        #     causal_mask = causal_mask.to(dtype=q.dtype)
+
+        causal_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                # attention_mask: (B, S) with 1 for tokens, 0 for pads
+                # -> (B, 1, 1, S) additive mask 0 / -inf
+                causal_mask = attention_mask[:, None, None, :].to(q.dtype)
+                causal_mask = (1.0 - causal_mask) * torch.finfo(q.dtype).min
+            elif attention_mask.dim() == 4:
+                # already a 4D mask, just cast to q.dtype
+                causal_mask = attention_mask.to(q.dtype)
+            else:
+                raise ValueError(
+                    f"Unsupported attention_mask dim={attention_mask.dim()} "
+                    "for SlimLlamaSdpaAttention"
+                )
+            
+        
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=causal_mask is None,
+        )                                              # (B, n_heads, T, d)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)  # (B, T, Hq)
+        attn_output = self.o_proj(attn_output)                                      # (B, T, hidden_size)
+
+        outputs = (attn_output, None, None)
+        if use_cache:
+            # re-use HF's cache format: (k, v)
+            present_key_value = (k, v)
+            outputs = outputs + (present_key_value,)
+        if output_attentions:
+            raise NotImplementedError("attn weights not wired, but easy to add if needed")
+
+        return outputs
+
+
+
+class SlimLlamaMLP(nn.Module):
+    def __init__(self, config: LlamaConfig, d_ff: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = d_ff
+
+        self.gate_proj = nn.Linear(self.hidden_size, d_ff, bias=False)
+        self.up_proj   = nn.Linear(self.hidden_size, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, self.hidden_size, bias=False)
+
+        self.act_fn = nn.SiLU()  # Llama uses SiLU
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+
+
+class SlimLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, Hq: int, d_ff: int):
+        super().__init__()
+        self.self_attn = SlimLlamaSdpaAttention(config, Hq=Hq)
+        self.mlp = SlimLlamaMLP(config, d_ff=d_ff)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn_outputs = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + attn_outputs[0]
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs = outputs + (attn_outputs[2],)  # present_key_value
+        if output_attentions:
+            outputs = outputs + (attn_outputs[1],)
+        return outputs
+
+
+
+
+class SlimLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, Hq: int, d_ff: int):
+        super().__init__()
+        self.self_attn = SlimLlamaSdpaAttention(config, Hq=Hq)
+        self.mlp = SlimLlamaMLP(config, d_ff=d_ff)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn_outputs = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + attn_outputs[0]
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs = outputs + (attn_outputs[2],)  # present_key_value
+        if output_attentions:
+            outputs = outputs + (attn_outputs[1],)
+        return outputs
+
+
+
+
+
+def load_slim_llama(slim_dir: str, dense_id: str, device="cuda"):
+    config = AutoConfig.from_pretrained(dense_id)
+    with open(os.path.join(slim_dir, "slim_meta.json"), "r") as f:
+        layer_meta = json.load(f)
+
+    model = SlimLlamaForCausalLM(config, layer_meta)
+    sd = torch.load(os.path.join(slim_dir, "slim.pt"), map_location="cpu")
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    print("missing:", missing)
+    print("unexpected:", unexpected)
+
+    return model.to(device).eval()
+
+
+
+
+def infer_slim_meta(slim_pt_path: str, output_json: str = None):
+    """
+    Infer per-layer slim metadata (Hq and d_ff) from slim.pt.
+    Produces a list like:
+      [{"Hq": 1536, "d_ff": 4096}, ...]
+    """
+
+    print(f"[load] slim state_dict: {slim_pt_path}")
+    sd = torch.load(slim_pt_path, map_location="cpu")
+
+    # Detect prefix (model.layers or layers)
+    prefixes = []
+    for k in sd.keys():
+        if k.startswith("model.layers."):
+            prefixes.append("model.layers")
+            break
+        if k.startswith("layers."):
+            prefixes.append("layers")
+            break
+    if not prefixes:
+        raise RuntimeError("Cannot find layer prefix (model.layers or layers) in slim.pt")
+
+    prefix = prefixes[0]
+    print(f"[info] detected prefix: '{prefix}'")
+
+    # Find number of layers
+    layer_ids = set()
+    layer_pat = re.compile(rf"^{prefix}\.(\d+)\.")
+    for k in sd.keys():
+        m = layer_pat.match(k)
+        if m:
+            layer_ids.add(int(m.group(1)))
+
+    if not layer_ids:
+        raise RuntimeError("Could not infer number of layers from slim state_dict")
+
+    num_layers = max(layer_ids) + 1
+    print(f"[info] detected num_layers = {num_layers}")
+
+    layer_meta = []
+
+    for layer in range(num_layers):
+        base = f"{prefix}.{layer}"
+
+        # --- Infer attention head count ---
+        qw = sd.get(f"{base}.self_attn.q_proj.weight", None)
+        if qw is None:
+            raise RuntimeError(f"Missing q_proj at layer {layer}")
+
+        Hq = qw.shape[0]      # q_proj.out_features
+        # But this is channels = Hq; in LLaMA: Hq = num_heads * head_dim
+
+        # --- Infer FFN expansion ---
+        up = sd.get(f"{base}.mlp.up_proj.weight", None)
+        if up is None:
+            raise RuntimeError(f"Missing mlp.up_proj at layer {layer}")
+
+        d_ff = up.shape[0]    # up_proj.out_features
+
+        layer_meta.append({
+            "Hq": int(Hq),
+            "d_ff": int(d_ff)
+        })
+
+        print(f"[L{layer}] Hq={Hq}, d_ff={d_ff}")
+
+    # Save
+    if output_json is None:
+        output_json = os.path.join(os.path.dirname(slim_pt_path), "slim_meta.json")
+
+    with open(output_json, "w") as f:
+        json.dump(layer_meta, f, indent=2)
+
+    print(f"[save] wrote {output_json}")
+    return layer_meta

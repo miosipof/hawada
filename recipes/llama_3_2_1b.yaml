@@ -23,14 +23,14 @@ data:
     batch_size: 1
     num_workers: 4
     streaming: false
-    size: 3000
+    size: 30000
     shuffle_buffer: 20000
     seed: 1234
   val:
     batch_size: 1
     num_workers: 4
     streaming: false
-    size: 300
+    size: 3000
     shuffle_buffer: 20000
     seed: 1234
 
@@ -44,10 +44,10 @@ trainer:
   log_every: 10
   kd:
     temperature: 4.0
-    alpha: 2.0
+    alpha: 1.0
   penalties:
     l0: 0.01                 # encourage sparsity
-    keep_floor_ratio: 0.5 
+    keep_floor_ratio: 0.25 
     bimodality: 1.0e-6
   constraints:
     min_keep_ratio: 0.25     # hard projection floor
