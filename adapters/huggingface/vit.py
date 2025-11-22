@@ -37,6 +37,7 @@ from core.export import (
 
 from core.utils import deepcopy_eval_cpu
 from core.search_export import grid_search_latency
+from core.proxy_cost import LatencyProxy
 
 # -----------------------------------------------------------------------------
 # Config

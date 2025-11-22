@@ -41,7 +41,7 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 from transformers import PreTrainedModel
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 
 # Core (absolute imports so running `-m examples.run_llama_optimize` works)
 from core.gates import HeadGate, GroupGate
@@ -1043,11 +1043,8 @@ class SlimLlamaModel(nn.Module):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-        self.rotary_emb = LlamaRotaryEmbedding(
-            dim=config.hidden_size // config.num_attention_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
 
     def forward(
         self,
@@ -1213,11 +1210,7 @@ class SlimLlamaSdpaAttention(nn.Module):
 
         # rotary stays same
         from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-        self.rotary_emb = LlamaRotaryEmbedding(
-            dim=self.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.attention_dropout = config.attention_dropout
 
     def forward(
@@ -1512,3 +1505,34 @@ def infer_slim_meta(slim_pt_path: str, output_json: str = None):
 
     print(f"[save] wrote {output_json}")
     return layer_meta
+
+
+
+def load_slim_for_finetune(
+    dense_id: str,
+    slim_dir: str,
+    device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.bfloat16,
+) -> SlimLlamaForCausalLM:
+    """
+    Load a pruned slim model (slim.pt) into a SlimLlamaForCausalLM instance
+    that is ready for training / fine-tuning.
+    """
+
+    # 1. Load dense base config + weights (we use it as a template)
+    dense = AutoModelForCausalLM.from_pretrained(
+        dense_id,
+        torch_dtype=dtype,
+    )
+
+    # 4. Build SlimLlamaForCausalLM with pruned modules + slim weights
+    slim = load_slim_llama(slim_dir, dense_id, device=device)
+
+
+    # 5. Make sure training-ish flags are sane
+    slim.config.use_cache = False          # we don’t want cache during training
+    slim.config._attn_implementation = "sdpa"  # consistent with our forward
+    slim.to(device)
+    slim.train()
+
+    return slim

@@ -19,7 +19,7 @@ import torch.nn as nn
 from core.gates import GroupGate
 from core.export import Rounding as CoreRounding, ExportPolicy as CoreExportPolicy
 from core.utils import deepcopy_eval_cpu
-
+from core.proxy_cost import LatencyProxy
 
 # ----------------------------- Gate wrapper -----------------------------
 

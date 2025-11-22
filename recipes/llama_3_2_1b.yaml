@@ -23,14 +23,14 @@ data:
     batch_size: 1
     num_workers: 4
     streaming: false
-    size: 30000
+    size: 400000
     shuffle_buffer: 20000
     seed: 1234
   val:
     batch_size: 1
     num_workers: 4
     streaming: false
-    size: 3000
+    size: 100000
     shuffle_buffer: 20000
     seed: 1234
 
