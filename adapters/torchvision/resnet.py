@@ -19,7 +19,7 @@ import torch.nn as nn
 from core.gates import GroupGate
 from core.export import Rounding as CoreRounding, ExportPolicy as CoreExportPolicy
 from core.utils import deepcopy_eval_cpu
-from core.proxy_cost import LatencyProxy
+from core.proxy_cost import LatencyProxy, _nchw_from_batch
 
 # ----------------------------- Gate wrapper -----------------------------
 
@@ -111,6 +111,9 @@ def _slice_bn2d(bn: nn.BatchNorm2d, keep_idx: torch.Tensor) -> nn.BatchNorm2d:
     new.running_var.copy_(bn.running_var.data[keep_idx])
     return new
 
+
+
+        
 # @torch.no_grad()
 # def _choose_group_indices(gate_like: BNWithGate, policy: ResNetExportPolicy, step: int) -> torch.Tensor:
 #     """Return sorted indices of kept *groups* for a BNWithGate.
@@ -213,6 +216,7 @@ class ResNetAdapter:
                 # Downsample path: keep as is; its BN will also be wrapped by recursion
         _wrap_bn(m)
         return m
+
 
     # ---- logits getter ----
     @staticmethod
@@ -380,6 +384,43 @@ class ResNetAdapter:
 
 # ------------------------------ ResNet Proxy ------------------------------
 
+
+def _find_anchor_param(model: nn.Module) -> torch.Tensor:
+    # Prefer any gate-like parameter; otherwise any parameter; else cpu scalar
+    for m in model.modules():
+        for nm in ("logits", "head_gate"):
+            t = getattr(m, nm, None)
+            if isinstance(t, torch.Tensor):
+                return t
+    for p in model.parameters():
+        return p
+    return torch.tensor(0.0)
+    
+def _as_const_like_resnet(x_like: torch.Tensor, val):
+    return torch.as_tensor(val, device=x_like.device, dtype=x_like.dtype)
+
+def _kept_from_gate(module, anchor: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return expected kept channels for a BN gate: probs.sum() * group_size.
+    If no gate is found, return None.
+    """
+    g = None
+    for nm in ("gate", "neuron_gate", "channel_gate", "bn_gate"):
+        if hasattr(module, nm):
+            g = getattr(module, nm)
+            break
+    if g is None and hasattr(module, "logits") and hasattr(module, "tau"):
+        g = module
+
+    if g is None or not hasattr(g, "logits"):
+        return None
+    logits = g.logits
+    tau = float(getattr(g, "tau", 1.5))
+    group = int(getattr(g, "group", getattr(g, "group_size", 1)))
+    if group <= 0: group = 1
+    probs = torch.sigmoid(logits / tau)
+    return probs.sum() * _as_const_like_resnet(anchor, group)
+
+    
 @dataclass
 class ResNetProxyConfig:
     scale_ms: float = 1.0
@@ -400,43 +441,7 @@ class ResNetLatencyProxy(LatencyProxy):
         super().__init__()
         self.cfg = cfg or ResNetProxyConfig()
 
-    @staticmethod
-    def _as_const_like_resnet(x_like: torch.Tensor, val):
-        return torch.as_tensor(val, device=x_like.device, dtype=x_like.dtype)
 
-    @staticmethod
-    def _find_anchor_param(model: nn.Module) -> torch.Tensor:
-        # Prefer any gate-like parameter; otherwise any parameter; else cpu scalar
-        for m in model.modules():
-            for nm in ("logits", "head_gate"):
-                t = getattr(m, nm, None)
-                if isinstance(t, torch.Tensor):
-                    return t
-        for p in model.parameters():
-            return p
-        return torch.tensor(0.0)
-
-    @staticmethod
-    def _kept_from_gate(module, anchor: torch.Tensor) -> Optional[torch.Tensor]:
-        """Return expected kept channels for a BN gate: probs.sum() * group_size.
-        If no gate is found, return None.
-        """
-        g = None
-        for nm in ("gate", "neuron_gate", "channel_gate", "bn_gate"):
-            if hasattr(module, nm):
-                g = getattr(module, nm)
-                break
-        if g is None and hasattr(module, "logits") and hasattr(module, "tau"):
-            g = module
-
-        if g is None or not hasattr(g, "logits"):
-            return None
-        logits = g.logits
-        tau = float(getattr(g, "tau", 1.5))
-        group = int(getattr(g, "group", getattr(g, "group_size", 1)))
-        if group <= 0: group = 1
-        probs = torch.sigmoid(logits / tau)
-        return probs.sum() * _as_const_like_resnet(anchor, group)
 
     def _add_cost(self, cost_like: torch.Tensor, oc, ic, k, stride, H, W):
         alpha = _as_const_like_resnet(cost_like, self.cfg.alpha_conv)
@@ -500,8 +505,11 @@ class ResNetLatencyProxy(LatencyProxy):
         """Calibrate `scale_ms` so proxy(model_keepall) ~= real latency in ms."""
         keep = keepall_export_fn(model)
         sample_shape = _nchw_from_batch(sample)
-        mean_ms, _ = profiler_fn(keep, sample_shape, device=device)
+        mean_ms, _, _ = profiler_fn(keep, sample_shape, device=device)
         soft = float(self.predict(model, sample).detach().cpu())
         self.cfg.scale_ms = mean_ms / max(soft, 1e-9)
         return mean_ms
+
+
+
 
