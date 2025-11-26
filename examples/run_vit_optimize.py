@@ -111,7 +111,7 @@ def build_from_recipe(recipe_path: str):
     # Calibrate scale on keep-all student
     keepall = ViTAdapter.export_keepall(student).to(device)
     latency_scale = proxy.calibrate(keepall, (B, 3, img_size, img_size), measure_latency_ms, device=device)  
-    base_ms, _ = measure_latency_ms(keepall, (B, 3, img_size, img_size), device=device)
+    base_ms, _, _ = measure_latency_ms(keepall, (B, 3, img_size, img_size), device=device)
 
     print(f"Latency proxy scale set to: {latency_scale:.6e}")  # было '... ms'
     print(f"Keep-all latency: {base_ms:.4f} ms on batch size = {B}")
@@ -260,13 +260,14 @@ def main():
         # slim = ViTAdapter.export_pruned(student, export_policy, step_for_export)
     
         # Measure latency before/after on a small val batch
-        mean_keep, p95_keep = measure_latency_ms(ViTAdapter.export_keepall(student), (B, 3, img_size, img_size), device=pack["device"])  # type: ignore[index]
-        mean_slim, p95_slim = measure_latency_ms(slim, (B, 3, img_size, img_size), device=pack["device"])  # type: ignore[index]
+        mean_keep, p95_keep, _ = measure_latency_ms(ViTAdapter.export_keepall(student), (B, 3, img_size, img_size), device=pack["device"])  # type: ignore[index]
+        mean_slim, p95_slim, _ = measure_latency_ms(slim, (B, 3, img_size, img_size), device=pack["device"])  # type: ignore[index]
     
         print(f"Keep-all: mean={mean_keep:.3f}ms p95={p95_keep:.3f}ms | Slim: mean={mean_slim:.3f}ms p95={p95_slim:.3f}ms | \nSpeedup={(mean_keep-mean_slim)/max(1e-6,mean_keep)*100:.2f}%")
     
         # Save artifacts
-        torch.save(slim.state_dict(), os.path.join(args.outdir, "vit_slim.pth"))
+        # torch.save(slim.state_dict(), os.path.join(args.outdir, "vit_slim.pth"))
+        torch.save(slim, os.path.join(args.outdir, "vit_slim.pth"))
         torch.save(student.state_dict(), os.path.join(args.outdir, "vit_gated.pth"))
     
         print(f"Saved pruned model to {os.path.join(args.outdir, 'vit_slim.pth')}")
@@ -309,8 +310,8 @@ def main():
 
     print(f"\nStarting benchmarking with batch size = {B}...")
         
-    mean_keep, p95_keep = measure_latency_ms(ViTAdapter.export_keepall(student), (B, 3, img_size, img_size), device=pack["device"])
-    mean_slim, p95_slim = measure_latency_ms(slim, (B, 3, img_size, img_size), device=pack["device"])
+    mean_keep, p95_keep, _ = measure_latency_ms(ViTAdapter.export_keepall(student), (B, 3, img_size, img_size), device=pack["device"])
+    mean_slim, p95_slim, _ = measure_latency_ms(slim, (B, 3, img_size, img_size), device=pack["device"])
 
     print(f"Keep-all: mean={mean_keep:.3f}ms p95={p95_keep:.3f}ms | Slim: mean={mean_slim:.3f}ms p95={p95_slim:.3f}ms | \n"
           f"Speedup={(mean_keep-mean_slim)/max(1e-6,mean_keep)*100:.2f}%")    
