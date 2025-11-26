@@ -37,6 +37,7 @@ from core.export import (
 
 from core.utils import deepcopy_eval_cpu
 from core.search_export import grid_search_latency
+from core.proxy_cost import LatencyProxy
 
 # -----------------------------------------------------------------------------
 # Config
@@ -327,8 +328,6 @@ class ViTAdapter:
         return slim
 
 
-
-
 # -----------------------------------------------------------------------------
 # Export policy
 # -----------------------------------------------------------------------------
@@ -381,3 +380,176 @@ def vit_search_best_export(
         make_policy=make_policy,
     )
     
+
+# -----------------------------------------------------------------------------
+# ViT proxy (analytic + gates), with scale and per-term weights
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ViTProxyConfig:
+    scale_ms: float = 1.0
+    alpha_qkv: float = 1.0
+    alpha_scores: float = 1.0
+    alpha_out: float = 1.0
+    alpha_mlp: float = 1.0
+
+class ViTLatencyProxy(LatencyProxy):
+    """Latency proxy for ViT models. Accepts batches or (N,C,H,W) tuples."""
+
+    def __init__(self, cfg: Optional[ViTProxyConfig] = None, lut: Optional[LatencyLUT] = None):
+        super().__init__()
+        self.cfg = cfg or ViTProxyConfig()
+        self.lut = lut or LatencyLUT()
+
+    # ---- helpers -------------------------------------------------------------
+    @staticmethod
+    def _input_spec(sample: TensorOrBatch) -> Tuple[int, int, int]:
+        if isinstance(sample, (tuple, list)) and len(sample) == 4 and all(isinstance(x, int) for x in sample):
+            B, C, H, W = sample
+            return int(B), int(H), int(W)
+        x = _first_tensor(sample)
+        if x.dim() != 4:
+            raise ValueError("ViTLatencyProxy expects a tensor [B,3,H,W] or a 4-tuple (B,3,H,W)")
+        B, C, H, W = x.shape
+        return int(B), int(H), int(W)
+
+    @staticmethod
+    def _vit_layers(m):
+        enc = getattr(m, "encoder", None)
+        if enc is not None and hasattr(enc, "layer"):
+            return enc.layer
+        vit = getattr(m, "vit", None)
+        if vit is not None and hasattr(vit, "encoder") and hasattr(vit.encoder, "layer"):
+            return vit.encoder.layer
+        raise TypeError("Expected a HF ViT with *.encoder.layer (ViTModel or ViTForImageClassification).")            
+
+    @staticmethod
+    def _patch_hw(cfg) -> Tuple[int, int]:
+        patch = getattr(cfg, "patch_size", 16)
+        if isinstance(patch, (tuple, list)):
+            return int(patch[0]), int(patch[1])
+        return int(patch), int(patch)
+
+    @staticmethod
+    def _soft_heads_from_block(blk) -> Optional[torch.Tensor]:
+        # Prefer a nested attention with kept_heads_soft()
+        attn = getattr(getattr(blk, "attention", None), "attention", None)
+        if attn is not None and hasattr(attn, "kept_heads_soft"):
+            return attn.kept_heads_soft()
+        return None
+
+    @staticmethod
+    def _find_ffn_gate(blk):
+        inter = getattr(blk, "intermediate", None)
+        if inter is None:
+            return None
+        # Common attribute names
+        for nm in ("neuron_gate", "gate", "ffn_gate"):
+            g = getattr(inter, nm, None)
+            if g is not None and hasattr(g, "logits") and hasattr(g, "tau"):
+                return g
+        # Last resort: scan children
+        for m in blk.modules():
+            if hasattr(m, "logits") and hasattr(m, "tau"):
+                return m
+        return None
+
+    # ---- proxy ---------------------------------------------------------------
+    def _predict_raw(
+        self,
+        model: nn.Module,
+        sample: TensorOrBatch,
+        *,
+        policy=None,
+        step: Optional[int] = None
+    ) -> torch.Tensor:
+        anchor = next((p for p in model.parameters()), torch.tensor(0.0))
+
+        B, H_img, W_img = self._input_spec(sample)
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            raise ValueError("Model must expose a HuggingFace-like .config for ViT proxy")
+        ph, pw = self._patch_hw(cfg)
+
+        S = _as_like(anchor, 1 + (H_img // ph) * (W_img // pw))
+        D = _as_like(anchor, int(getattr(cfg, "hidden_size", 768)))
+        Hh = _as_like(anchor, int(getattr(cfg, "num_attention_heads", 12)))
+        Dh = D // Hh
+
+        warm = False
+        if policy is not None and step is not None:
+            warm = (step < int(getattr(policy, "warmup_steps", 0)))
+
+        total_qkv = _as_like(anchor, 0.0)
+        total_scores = _as_like(anchor, 0.0)
+        total_out = _as_like(anchor, 0.0)
+        total_mlp = _as_like(anchor, 0.0)
+
+        default_hidden = _as_like(anchor, int(getattr(cfg, "intermediate_size", 4 * int(D))))
+
+        layers = _vit_layers(model)
+        for blk in layers:
+            heads_soft = Hh if warm else (self._soft_heads_from_block(blk) or Hh)
+
+            # FFN hidden expectation
+            if warm:
+                hidden_soft = default_hidden
+            else:
+                g = self._find_ffn_gate(blk)
+                if g is None:
+                    hidden_soft = default_hidden
+                else:
+                    probs = torch.sigmoid(g.logits / g.tau)
+                    group = int(getattr(g, "group", getattr(g, "group_size", 16)))
+                    hidden_soft = probs.sum() * _as_like(anchor, group)
+
+            D_kept = heads_soft * Dh
+
+            total_qkv += 3 * S * D * D_kept
+            total_scores += (S * S) * heads_soft * Dh
+            total_out += S * D_kept * D
+            total_mlp += 2 * S * D * hidden_soft
+
+        raw = (
+            self.cfg.alpha_qkv * total_qkv
+            + self.cfg.alpha_scores * total_scores
+            + self.cfg.alpha_out * total_out
+            + self.cfg.alpha_mlp * total_mlp
+        )
+        raw_ms = raw * _as_like(anchor, float(self.cfg.scale_ms))
+
+        # optional LUT correction
+        sig = self.signature(model, sample, policy=policy, step=step)
+        return self.lut.blend(raw_ms, sig)
+
+    # A reasonable default signature for ViT workloads
+    def signature(self, model: nn.Module, sample, *, policy=None, step: Optional[int] = None) -> Tuple:
+        if torch.is_tensor(sample):
+            shp = tuple(sample.shape)
+        elif isinstance(sample, (tuple, list)):
+            shp = tuple(sample)
+        elif isinstance(sample, dict):
+            shp = tuple((k, tuple(v.shape)) for k, v in sample.items() if torch.is_tensor(v))
+        else:
+            shp = (str(type(sample)),)
+        cfg = getattr(model, "config", None)
+        heads = int(getattr(cfg, "num_attention_heads", 12))
+        hidden = int(getattr(cfg, "hidden_size", 768))
+        inter = int(getattr(cfg, "intermediate_size", 3072))
+        return ("ViT", shp, heads, hidden, inter)
+
+    @torch.no_grad()
+    def calibrate(self, model: nn.Module, shape: tuple, measure_fn, *, device: str = "cuda") -> float:
+        """Set proxy scale so that keep-all student matches measured ms.
+    
+        `measure_fn(model, shape_or_tensor)` should return `(mean_ms, p95_ms)`.
+        """
+        
+        sample_t = torch.randn(shape, device=device)
+    
+        sample_t = sample_t.to(device)
+        model = model.to(device).eval()
+        mean_ms, _ = measure_fn(model, shape, device=device)
+        soft_ms = self.predict(model, sample_t).item()
+        self.cfg.scale_ms = float(mean_ms / max(soft_ms, 1e-9))
+        return self.cfg.scale_ms    

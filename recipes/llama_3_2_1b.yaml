@@ -23,38 +23,45 @@ data:
     batch_size: 1
     num_workers: 4
     streaming: false
-    size: 3000
+    size: 400000
     shuffle_buffer: 20000
     seed: 1234
   val:
     batch_size: 1
     num_workers: 4
     streaming: false
-    size: 300
+    size: 100000
     shuffle_buffer: 20000
     seed: 1234
 
-train:
+trainer:
+  amp: true
   device: cuda
-  epochs: 10
-  grad_accum_steps: 1
-  max_grad_norm: 1.0
-  amp_dtype: bf16
-  use_cosine: false
-  weight_decay: 1.0e-4
-  betas: [0.9, 0.95]
-  optimizer: adafactor
-  lrs:
-    lr: 5.0e-5         # main LR for fine-tune
-    gate_lr: 5.0e-2    # for gate-only phase (search/attach loop)
-    weight_lr: 1.0e-4  # for 2-pass gate training (if used)
+  probe_batch_override: 64
+  mse_weight: 0.1
+  early_stopping_patience: 3
+  early_stopping_lambda: 1e-5  
+  log_every: 10
   kd:
-    T: 4.0
-    alpha: 0.9         # weight of KD term
-    ce_weight: 0.1     # small CE on teacher argmax for stability
-    decode_kd_steps: 0 # set >0 to add lightweight decode KD
-  logging:
-    log_every: 100
+    temperature: 4.0
+    alpha: 1.0
+  penalties:
+    l0: 0.01                 # encourage sparsity
+    keep_floor_ratio: 0.25 
+    bimodality: 1.0e-6
+  constraints:
+    min_keep_ratio: 0.25     # hard projection floor
+    min_groups: 1
+  lagrange:
+    real_every: 10         # measure real latency every N steps (export-eval policy)
+    lr_gate: 5.0e-3        
+    lr_weight: 5.0e-4
+    lr_linear: 1.0e-4
+    lr_affine: 3.0e-4
+    wd_linear: 1.0e-4    
+    tau_target_scale: 0.6  # target = tau_target_scale * keep-all latency
+
+    
 
 latency_proxy:
   type: LLM            # LatencyProxyLLM
@@ -70,31 +77,29 @@ latency_proxy:
     S: 1024
     T: 128
 
-gate_training:          # optional 2-pass “optimize for latency” stage
-  tau_target_ms: 0.85   # latency budget for proxy constraint (example)
-  step_warmup_for_proxy: 5
-  real_latency_every: 20
-  export_eval_policy:
-    warmup_steps: 0
-    q_head_floor_post: 4
-    q_head_multiple_post: 8
-    ffn_min_keep_ratio_post: 0.80
-    ffn_snap_groups_post: 32
+# gate_training:          # optional 2-pass “optimize for latency” stage
+#   tau_target_ms: 0.85   # latency budget for proxy constraint (example)
+#   step_warmup_for_proxy: 5
+#   real_latency_every: 20
+#   export_eval_policy:
+#     warmup_steps: 0
+#     q_head_floor_post: 4
+#     q_head_multiple_post: 8
+#     ffn_min_keep_ratio_post: 0.80
+#     ffn_snap_groups_post: 32
 
 export:
-  # Adapter uses LlamaExportPolicy with separate rounding for heads/FFN
   warmup_steps: 200
   heads:
-    rounding:
-      # Keep >= 8 heads and snap to multiple of 8.
-      # Adapter then LCM-snaps with Hkv (GQA) to remain valid.
-      floor: 8
-      multiple: 8
+    floor: 16
+    multiple: 4
   ffn:
-    rounding:
-      min_keep_ratio: 0.80
-      multiple: 32
-
+    min_keep_ratio: 0.50
+    multiple: 16
+  q:
+    min_keep_ratio: 0.50
+    multiple: 8
+    
 search:
   # Grid for post-export latency search (uses grid_search_latency)
   head_multiples: [1, 2, 4, 8]
