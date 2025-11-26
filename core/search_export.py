@@ -61,7 +61,7 @@ def grid_search_latency(
             rounding=CoreRounding(floor_groups=1, multiple_groups=int(hm), min_keep_ratio=0.0),
         )
         slim = export_fn(model_with_gates, policy, step)
-        mean_ms, p95_ms = measure_latency_ms(slim, batch_shape, settings=measure_settings, device=device)
+        mean_ms, p95_ms, _ = measure_latency_ms(slim, batch_shape, settings=measure_settings, device=device)
         rec = {"head_multiple": int(hm), "ffn_snap": int(fs), "mean_ms": float(mean_ms), "p95_ms": float(p95_ms)}
         print(f"[{i}/{len(list(to_try))}] head_multiple {int(hm)} | ffn_snap {int(fs)} | mean_ms = {float(mean_ms)}")
         trials.append(rec)
