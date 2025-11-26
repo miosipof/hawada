@@ -59,8 +59,12 @@ from transformers import AutoConfig, ViTForImageClassification
 from huggingface_hub import HfApi, create_repo, upload_folder
 from copy import deepcopy
 
+from adapters.huggingface.llama import SlimLlamaForCausalLM
+from adapters.huggingface.llama import load_slim_llama
+
 # --- tiny utils --------------------------------------------------------------
 
+os.environ["HF_TOKEN"] = "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"
 
 
 def _ensure_dir(p: Path):
@@ -68,47 +72,91 @@ def _ensure_dir(p: Path):
 
 def _write_readme(dst: Path, title: str, task: str, extra: dict):
     md = dst / "README.md"
-    lines = ["```yaml",
+
+    if task == "causal-lm":
+        tags = [
+            "llama",
+            "causal-lm",
+            "text-generation",
+            "pruning",
+            "knowledge-distillation",
+            "speedup",
+        ]
+        pipeline_tag = "text-generation"
+        dataset = extra.get("dataset", "slimpajama-test")
+    else:
+        tags = [
+            "resnet",
+            "pruning",
+            "knowledge-distillation",
+            "speedup",
+        ]
+        pipeline_tag = "image-classification"
+        dataset = extra.get("dataset", "imagenet-1k")
+
+    lines = [
+        "```yaml",
         "---",
         "library_name: pytorch",
         "tags:",
-        "  - resnet",
-        "  - pruning",
-        "  - knowledge-distillation",
-        "  - speedup",
-        "license: apache-2.0",
-        "dataset: imagenet-1k",
-        "pipeline_tag: image-classification",
-        "---",
-        "```"]
-    
-    lines += [f"# {title}\n"]
+    ]
+    for t in tags:
+        lines.append(f"  - {t}")
     lines += [
-        "This repository contains two variants:",
-        "- **Gated student** (with learned pruning gates) – requires custom code.",
-        "- **Slim student** (post-prune/export) – loads with standard code (LLM) or bundled code (ResNet).",
-        "",
-        "## Inference (LLM, slim)",
-        "```python",
-        "from transformers import AutoModelForCausalLM, AutoTokenizer",
-        f"tok = AutoTokenizer.from_pretrained('{extra.get('repo_slim','')}')",
-        f"mdl = AutoModelForCausalLM.from_pretrained('{extra.get('repo_slim','')}', torch_dtype='auto').eval()",
-        "x = tok('Hello', return_tensors='pt')",
-        "print(tok.decode(mdl.generate(**x, max_new_tokens=16)[0]))",
+        "license: apache-2.0",
+        f"dataset: {dataset}",
+        f"pipeline_tag: {pipeline_tag}",
+        "---",
         "```",
         "",
+        f"# {title}",
+        "",
+        "This repository contains two variants:",
+        "- **Gated student** (with learned pruning gates) – requires custom code.",
+        "- **Slim student** (post-prune/export) – loads with standard HF APIs plus this repo’s custom code.",
+        "",
+    ]
+
+    if task == "causal-lm":
+        lines += [
+            "## Inference (LLaMA slim)",
+            "```python",
+            "from transformers import AutoModelForCausalLM, AutoTokenizer",
+            f"tok = AutoTokenizer.from_pretrained('{extra.get('repo_slim','')}')",
+            f"mdl = AutoModelForCausalLM.from_pretrained('{extra.get('repo_slim','')}', torch_dtype='auto').eval()",
+            "x = tok('Hello', return_tensors='pt')",
+            "print(tok.decode(mdl.generate(**x, max_new_tokens=16)[0]))",
+            "```",
+            "",
+        ]
+    else:
+        lines += [
+            "## Inference (Vision slim)",
+            "```python",
+            "import torch",
+            "from torchvision import transforms",
+            "from PIL import Image",
+            "",
+            f"repo = '{extra.get('repo_slim','')}'",
+            "img = Image.open('some_image.jpg')",
+            "# ... your preprocessing here ...",
+            "```",
+            "",
+        ]
+
+    lines += [
         "## Notes",
         "- The **gated** repo includes lightweight custom code (adapters/…, core/…) needed to attach/load gates.",
-        "- The **slim** LLM is exported to standard HF architecture for out-of-the-box loading.",
-        "- For ResNet, both repos include minimal custom code to define the module.",
+        "- The **slim** model is exported for efficient inference.",
         "",
         "## Training metadata",
         "```json",
         json.dumps(extra, indent=2),
         "```",
-        ""
+        "",
     ]
     md.write_text("\n".join(lines), encoding="utf-8")
+
 
 def _copy_code_tree(dst: Path, roots: List[str]):
     for r in roots:
@@ -370,45 +418,61 @@ def export_llama_variants(
 ):
     api = HfApi(token=token)
 
-    # Load base config & tokenizer
+    # Load base config & tokenizer (used as template)
     cfg = AutoConfig.from_pretrained(base_id, trust_remote_code=True)
     tok = AutoTokenizer.from_pretrained(base_id, use_fast=True)
 
-    # ---------- (a) Gated student (custom-code) ----------
+    # -------------------------------------------------------------------------
+    # (a) Gated student (custom code, state_dict only)
+    # -------------------------------------------------------------------------
     gated_dir = Path("hf_export_gated_llama")
     if gated_dir.exists():
         shutil.rmtree(gated_dir)
     _ensure_dir(gated_dir)
 
-    # Save tokenizer/config
     tok.save_pretrained(gated_dir)
     cfg.save_pretrained(gated_dir)
 
-    # Save checkpoint (just state dict); custom code will define class at load time
-    # Expect your loader to call LlamaAdapter(student).attach_gates(...) then load_state_dict.
-    sd = torch.load(student_ckpt, map_location="cpu", weights_only=False)
-    torch.save(sd, gated_dir / "pytorch_model.bin")
+    obj_student = torch.load(student_ckpt, map_location="cpu", weights_only=False)
 
-    # Bundle custom code
+    # Normalize to pure state_dict for robustness
+    if isinstance(obj_student, torch.nn.Module):
+        sd_student = obj_student.state_dict()
+    elif isinstance(obj_student, dict):
+        # assume it's already a state_dict-like mapping
+        sd_student = obj_student
+    else:
+        raise TypeError(
+            f"[gated] Unexpected object type in {student_ckpt}: {type(obj_student)}. "
+            "Expected nn.Module or state_dict-like dict."
+        )
+
+    torch.save(sd_student, gated_dir / "pytorch_model.bin")
+
     if include_code:
         _copy_code_tree(gated_dir, include_code)
-        # HF flag so code is trusted
         (gated_dir / "custom_code.py").write_text(
-            "# Marker file so Hub shows 'custom code' banner.\n", encoding="utf-8"
+            "# Marker file so Hub shows 'custom code' banner for gated LLaMA.\n",
+            encoding="utf-8",
         )
 
     _save_model_card_and_meta(
-        gated_dir, title=f"{repo_gated}", task="causal-lm",
+        gated_dir,
+        title=repo_gated,
+        task="causal-lm",
         meta={"base_id": base_id, "variant": "gated-student"},
-        include_code=include_code, repo_slim=repo_slim
+        include_code=include_code,
+        repo_slim=repo_slim,
     )
 
     if push:
         create_repo(repo_gated, token=token, private=private, exist_ok=True)
         upload_folder(repo_id=repo_gated, folder_path=str(gated_dir), token=token)
-        print(f"[ok] Pushed gated student → {repo_gated}")
+        print(f"[ok] Pushed gated LLaMA student → {repo_gated}")
 
-    # ---------- (b) Slim (standard HF) ----------
+    # -------------------------------------------------------------------------
+    # (b) Slim model (HF-compatible SlimLlamaForCausalLM + custom code)
+    # -------------------------------------------------------------------------
     slim_dir = Path("hf_export_slim_llama")
     if slim_dir.exists():
         shutil.rmtree(slim_dir)
@@ -417,13 +481,17 @@ def export_llama_variants(
     tok.save_pretrained(slim_dir)
     cfg.save_pretrained(slim_dir)
 
-    # Build a base model then load slim state dict (exported to standard arch)
-    mdl = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype="auto", trust_remote_code=True)
-    sd_slim = torch.load(slim_ckpt, map_location="cpu", weights_only=False)
-    missing, unexpected = mdl.load_state_dict(sd_slim, strict=False)
-    print(f"[slim] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+    # Load slim checkpoint: accept either full model or pure state_dict
+    mdl = load_slim_llama(slim_ckpt, base_id, device="cpu")
 
-    mdl.save_pretrained(slim_dir, safe_serialization=True)
+    # # Build a base model then load the pruned weights
+    # mdl = AutoModelForCausalLM.from_pretrained(
+    #     base_id, torch_dtype="auto", trust_remote_code=True
+    # )
+    # missing, unexpected = mdl.load_state_dict(sd_slim, strict=False)
+    # print(f"[slim] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+
+    mdl.save_pretrained(slim_dir, safe_serialization=False)
 
     _save_model_card_and_meta(
         slim_dir, title=f"{repo_slim}", task="causal-lm",

@@ -1420,11 +1420,21 @@ def load_slim_llama(slim_dir: str, dense_id: str, device="cuda"):
         layer_meta = json.load(f)
 
     model = SlimLlamaForCausalLM(config, layer_meta)
-    sd = torch.load(os.path.join(slim_dir, "slim.pt"), map_location="cpu")
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print("missing:", missing)
-    print("unexpected:", unexpected)
+    slim = torch.load(os.path.join(slim_dir, "slim.pt"), map_location="cpu", weights_only=False)
 
+    try:
+        missing, unexpected = model.load_state_dict(slim, strict=False)
+        print("missing:", missing)
+        print("unexpected:", unexpected)
+    except Exception as e:
+        print("Unable to load as state_dict, trying to load as full model...")
+
+        state_dict = slim.state_dict()
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print("missing:", missing)
+        print("unexpected:", unexpected)
+        
+        
     return model.to(device).eval()
 
 
