@@ -64,9 +64,6 @@ from adapters.huggingface.llama import load_slim_llama
 
 # --- tiny utils --------------------------------------------------------------
 
-os.environ["HF_TOKEN"] = "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"
-
-
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
