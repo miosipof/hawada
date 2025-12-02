@@ -19,7 +19,7 @@ import torch.nn as nn
 from core.gates import GroupGate
 from core.export import Rounding as CoreRounding, ExportPolicy as CoreExportPolicy
 from core.utils import deepcopy_eval_cpu
-from core.proxy_cost import LatencyProxy
+from core.proxy_cost import LatencyProxy, _nchw_from_batch
 
 # ----------------------------- Gate wrapper -----------------------------
 
@@ -385,7 +385,9 @@ class ResNetProxyConfig:
     scale_ms: float = 1.0
     alpha_conv: float = 1.0   # weight for conv FLOPs term
 
-
+def _as_const_like_resnet(x_like: torch.Tensor, val):
+    return torch.as_tensor(val, device=x_like.device, dtype=x_like.dtype)
+        
 class ResNetLatencyProxy(LatencyProxy):
     """Latency proxy for ResNet-like backbones with BN gates.
 
@@ -399,10 +401,6 @@ class ResNetLatencyProxy(LatencyProxy):
     def __init__(self, cfg: Optional[ResNetProxyConfig] = None):
         super().__init__()
         self.cfg = cfg or ResNetProxyConfig()
-
-    @staticmethod
-    def _as_const_like_resnet(x_like: torch.Tensor, val):
-        return torch.as_tensor(val, device=x_like.device, dtype=x_like.dtype)
 
     @staticmethod
     def _find_anchor_param(model: nn.Module) -> torch.Tensor:
@@ -448,7 +446,7 @@ class ResNetLatencyProxy(LatencyProxy):
 
     def _predict_raw(self, model: nn.Module, sample: TensorOrBatch, **_) -> torch.Tensor:
         N, C_in, H0, W0 = _nchw_from_batch(sample)
-        anchor = _find_anchor_param(model)
+        anchor = self._find_anchor_param(model)
         cost = _as_const_like_resnet(anchor, 0.0)
         H = _as_const_like_resnet(anchor, int(H0))
         W = _as_const_like_resnet(anchor, int(W0))
@@ -460,7 +458,7 @@ class ResNetLatencyProxy(LatencyProxy):
         s = conv1.stride[0]
         kept_out = None
         if bn1 is not None:
-            kept = _kept_from_gate(bn1, anchor)
+            kept = self._kept_from_gate(bn1, anchor)
             if kept is not None:
                 kept_out = kept
         oc_eff = kept_out if kept_out is not None else _as_const_like_resnet(anchor, conv1.out_channels)
@@ -472,14 +470,14 @@ class ResNetLatencyProxy(LatencyProxy):
             c1 = block.conv1
             b1 = block.bn1 if hasattr(block, "bn1") else None
             k1, s1 = c1.kernel_size[0], c1.stride[0]
-            oc1_eff = _kept_from_gate(b1, anchor) or _as_const_like_resnet(anchor, c1.out_channels)
+            oc1_eff = self._kept_from_gate(b1, anchor) or _as_const_like_resnet(anchor, c1.out_channels)
             cost, H, W = self._add_cost(cost, oc1_eff, in_ch, k1, s1, H, W)
 
             # conv2 -> bn2
             c2 = block.conv2
             b2 = block.bn2 if hasattr(block, "bn2") else None
             k2, s2 = c2.kernel_size[0], c2.stride[0]
-            oc2_eff = _kept_from_gate(b2, anchor) or _as_const_like_resnet(anchor, c2.out_channels)
+            oc2_eff = self._kept_from_gate(b2, anchor) or _as_const_like_resnet(anchor, c2.out_channels)
             cost, H, W = self._add_cost(cost, oc2_eff, oc1_eff, k2, s2, H, W)
 
             return oc2_eff, H, W, cost
@@ -500,7 +498,7 @@ class ResNetLatencyProxy(LatencyProxy):
         """Calibrate `scale_ms` so proxy(model_keepall) ~= real latency in ms."""
         keep = keepall_export_fn(model)
         sample_shape = _nchw_from_batch(sample)
-        mean_ms, _ = profiler_fn(keep, sample_shape, device=device)
+        mean_ms, _, _ = profiler_fn(keep, sample_shape, device=device)
         soft = float(self.predict(model, sample).detach().cpu())
         self.cfg.scale_ms = mean_ms / max(soft, 1e-9)
         return mean_ms

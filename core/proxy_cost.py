@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, Tuple, Union, List
 import torch
 import torch.nn as nn
 
-from .gates import iter_gates, _as_like  # _as_like is used by ViT proxy
+from .gates import iter_gates, _as_like
 
 
 # -----------------------------------------------------------------------------

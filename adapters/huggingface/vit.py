@@ -37,7 +37,8 @@ from core.export import (
 
 from core.utils import deepcopy_eval_cpu
 from core.search_export import grid_search_latency
-from core.proxy_cost import LatencyProxy
+from core.proxy_cost import LatencyProxy, LatencyLUT, _first_tensor
+from core.gates import _as_like
 
 # -----------------------------------------------------------------------------
 # Config
@@ -487,7 +488,7 @@ class ViTLatencyProxy(LatencyProxy):
 
         default_hidden = _as_like(anchor, int(getattr(cfg, "intermediate_size", 4 * int(D))))
 
-        layers = _vit_layers(model)
+        layers = self._vit_layers(model)
         for blk in layers:
             heads_soft = Hh if warm else (self._soft_heads_from_block(blk) or Hh)
 
@@ -549,7 +550,10 @@ class ViTLatencyProxy(LatencyProxy):
     
         sample_t = sample_t.to(device)
         model = model.to(device).eval()
-        mean_ms, _ = measure_fn(model, shape, device=device)
+        mean_ms, _, _ = measure_fn(model, shape, device=device)
         soft_ms = self.predict(model, sample_t).item()
         self.cfg.scale_ms = float(mean_ms / max(soft_ms, 1e-9))
         return self.cfg.scale_ms    
+
+
+

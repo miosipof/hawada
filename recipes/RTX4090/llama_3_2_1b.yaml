@@ -1,0 +1,114 @@
+# LLaMA 3.2 1B (HF) — pruning + KD fine-tuning recipe
+# Save as: recipes/llama_3_2_1b.yaml
+
+model:
+  hf_id: meta-llama/Llama-3.2-1B
+  adapter: huggingface.llama  # LlamaAdapter
+
+gating:
+  tau: 1.5
+  init_logit: 3.0
+  head_gating: true
+  gate_kv: false            # keep KV ungated (proxy assumes Q-only)
+  ffn_group: 128            # SwiGLU group size
+  ffn_gating: true
+  hard_eval: true
+
+data:
+  # Streaming/packed SlimPajama test shards as used in your code
+  dataset_name: fla-hub/slimpajama-test
+  tokenizer_name: meta-llama/Llama-3.2-1B
+  seq_len: 1024
+  train:
+    batch_size: 1
+    num_workers: 4
+    streaming: false
+    size: 400000
+    shuffle_buffer: 20000
+    seed: 1234
+  val:
+    batch_size: 1
+    num_workers: 4
+    streaming: false
+    size: 100000
+    shuffle_buffer: 20000
+    seed: 1234
+
+trainer:
+  amp: true
+  device: cuda
+  probe_batch_override: 64
+  mse_weight: 0.1
+  early_stopping_patience: 3
+  early_stopping_lambda: 1e-5  
+  log_every: 10
+  kd:
+    temperature: 4.0
+    alpha: 1.0
+  penalties:
+    l0: 0.01                 # encourage sparsity
+    keep_floor_ratio: 0.25 
+    bimodality: 1.0e-6
+  constraints:
+    min_keep_ratio: 0.25     # hard projection floor
+    min_groups: 1
+  lagrange:
+    real_every: 10         # measure real latency every N steps (export-eval policy)
+    lr_gate: 5.0e-3        
+    lr_weight: 5.0e-4
+    lr_linear: 1.0e-4
+    lr_affine: 3.0e-4
+    wd_linear: 1.0e-4    
+    tau_target_scale: 0.6  # target = tau_target_scale * keep-all latency
+
+    
+
+latency_proxy:
+  type: LLM            # LatencyProxyLLM
+  gate_kv_in_proxy: false
+  # Initial weights; you’ll calibrate scale_ms automatically
+  scale_ms: 1.0
+  alpha_qkv: 1.0
+  alpha_scores: 1.0
+  alpha_out: 1.0
+  alpha_mlp: 1.0
+  measure:
+    B: 1
+    S: 1024
+    T: 128
+
+# gate_training:          # optional 2-pass “optimize for latency” stage
+#   tau_target_ms: 0.85   # latency budget for proxy constraint (example)
+#   step_warmup_for_proxy: 5
+#   real_latency_every: 20
+#   export_eval_policy:
+#     warmup_steps: 0
+#     q_head_floor_post: 4
+#     q_head_multiple_post: 8
+#     ffn_min_keep_ratio_post: 0.80
+#     ffn_snap_groups_post: 32
+
+export:
+  warmup_steps: 200
+  heads:
+    floor: 16
+    multiple: 4
+  ffn:
+    min_keep_ratio: 0.50
+    multiple: 16
+  q:
+    min_keep_ratio: 0.50
+    multiple: 8
+    
+search:
+  # Grid for post-export latency search (uses grid_search_latency)
+  head_multiples: [1, 2, 4, 8]
+  ffn_snaps: [1, 32, 64, 128]
+  # Batch shape interpreted by the LLaMA adapter runner as (B,S)
+  batch_shape: [1, 1024]
+  device: cuda
+
+outputs:
+  run_dir: runs/llama_3_2_1b/
+  slim_path: runs/llama_3_2_1b/slim.pth
+  export_log: runs/llama_3_2_1b/export.log
