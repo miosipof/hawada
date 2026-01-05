@@ -164,7 +164,7 @@ def grid_search_export(student: nn.Module, *, device: str, img_size: int, B: int
             min_keep_ratio=min_keep_ratio,
         )
         slim = ResNetAdapter.export_pruned(student, policy, step=9999).to(device)
-        mean_ms, p95_ms = measure_latency_ms(slim, (B, 3, img_size, img_size), device=device)
+        mean_ms, p95_ms, _ = measure_latency_ms(slim, (B, 3, img_size, img_size), device=device)
         rec = {"multiple_groups": int(M), "mean_ms": float(mean_ms), "p95_ms": float(p95_ms)}
         trials.append(rec)
         if (best is None) or (rec["mean_ms"] < best["mean_ms"]):
@@ -302,8 +302,8 @@ def main():
     
     B = pack["batch_size"]; H = W = pack["img_size"]
     print(f"Starting benchmarking with batch size = {B}...")
-    mean_keep, p95_keep = measure_latency_ms(ResNetAdapter.export_keepall(student), (B, 3, H, W), device=device)
-    mean_slim, p95_slim = measure_latency_ms(slim, (B, 3, H, W), device=device)
+    mean_keep, p95_keep, _ = measure_latency_ms(ResNetAdapter.export_keepall(student), (B, 3, H, W), device=device)
+    mean_slim, p95_slim, _ = measure_latency_ms(slim, (B, 3, H, W), device=device)
     print(f"Base: mean={mean_keep:.3f}ms p95={p95_keep:.3f}ms")
     print(f"Slim: mean={mean_slim:.3f}ms p95={p95_slim:.3f}ms\n")
     if mean_keep > 0:

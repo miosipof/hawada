@@ -24,10 +24,24 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Callable, Tuple
 
 import copy
+from copy import deepcopy
+from typing import Optional
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+import os
+import re
+
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+from transformers import PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM
 
 # Core (absolute imports so running `-m examples.run_llama_optimize` works)
 from core.gates import HeadGate, GroupGate
@@ -39,6 +53,7 @@ from core.export import (
 )
 from core.utils import deepcopy_eval_cpu
 from core.search_export import grid_search_latency
+from core.proxy_cost import LatencyProxy
 
 # -------------------------------------------------------------------------
 # Configs
@@ -406,117 +421,230 @@ class LlamaAdapter:
                 delattr(mlp, "neuron_gate")
 
         return slim
-
+    
     @staticmethod
     @torch.no_grad()
     def export_pruned(model_with_gates: nn.Module, policy, step: int) -> nn.Module:
         """
         Produce a clean CPU eval model:
-          - Read gates to choose Q heads; slice q_proj rows and o_proj cols
-          - Snap kept heads to an LCM of (policy multiple, Hkv)
-          - Slice SwiGLU up/gate/down by groups
-          - Unwrap back to plain HF modules; update metadata
+    
+          - Attention:
+            * Read per-head gates, rank heads.
+            * Choose H_keep heads with rounding/constraints.
+            * Slice q_proj rows and o_proj cols.
+            * Keep k_proj / v_proj (GQA) but update num_heads / num_key_value_groups.
+    
+          - MLP:
+            * Read GroupGate over SwiGLU expansion.
+            * Choose kept groups with rounding/constraints.
+            * Slice up_proj/gate_proj (out) and down_proj (in).
+            * Restore original forward, drop gates.
+    
+        Does NOT touch:
+          - hidden_size / embeddings / norms / lm_head.
         """
-        # Accept either CoreExportPolicy with per-axis rounding or family policy
+    
+        # -------------------------------------------------------------------------
+        # Unpack policy
+        # -------------------------------------------------------------------------
+    
         if isinstance(policy, LlamaExportPolicy):
-            head_rounding = policy.head_rounding
-            ffn_rounding = policy.ffn_rounding
-            warmup_steps = policy.warmup_steps
+            head_rounding = policy.head_rounding   # has: floor_groups, multiple_groups, min_keep_ratio
+            ffn_rounding  = policy.ffn_rounding
+            q_rounding    = getattr(policy, "q_rounding", None)  # currently unused, kept for future
+            warmup_steps  = int(policy.warmup_steps)
         else:
             head_rounding = getattr(policy, "rounding", None)
-            ffn_rounding = getattr(policy, "rounding", None)
-            warmup_steps = int(getattr(policy, "warmup_steps", 0))
-
+            ffn_rounding  = getattr(policy, "rounding", None)
+            q_rounding    = None
+            warmup_steps  = int(getattr(policy, "warmup_steps", 0))
+    
+        # Safety defaults if rounding is None
+        class _DefaultRound:
+            def __init__(self):
+                self.floor_groups = 1
+                self.multiple_groups = 1
+                self.min_keep_ratio = 0.0
+    
+        if head_rounding is None:
+            head_rounding = _DefaultRound()
+        if ffn_rounding is None:
+            ffn_rounding = _DefaultRound()
+    
+        warm = (step < warmup_steps)
+    
+        # -------------------------------------------------------------------------
+        # Clone model to CPU + eval
+        # -------------------------------------------------------------------------
+        def deepcopy_eval_cpu(m: nn.Module) -> nn.Module:
+            m = deepcopy(m)
+            m.eval()
+            return m.cpu()
+    
         slim = deepcopy_eval_cpu(model_with_gates)
         core = getattr(slim, "model", slim)
         layers = getattr(core, "layers", None)
         if layers is None:
             return slim
-
-        warm = (step < warmup_steps)
-
-        def _lcm(a: int, b: int) -> int:
-            return abs(a * b) // math.gcd(max(a, 1), max(b, 1)) if a > 0 and b > 0 else max(a, b, 1)
-
+        
+        # -------------------------------------------------------------------------
+        # Helpers
+        # -------------------------------------------------------------------------
+        def _snap_heads(Hq: int, raw_keep: int, Hkv: int, cfg) -> int:
+            """
+            Snap number of kept heads to something compatible with:
+              - min_keep_ratio
+              - floor_groups
+              - multiple_groups
+              - GQA constraint (multiple of Hkv).
+            """
+            # minimum allowed heads from ratio / floor
+            min_by_ratio = int(math.ceil(cfg.min_keep_ratio * Hq))
+            min_by_floor = int(cfg.floor_groups)
+            min_keep = max(min_by_ratio, min_by_floor, Hkv)  # must have at least one KV-group
+    
+            # base step in heads: must be multiple of Hkv
+            step = int(cfg.multiple_groups)
+            if step < Hkv:
+                # we must respect GQA: groups = H_keep / Hkv must be integer
+                step = Hkv
+    
+            raw_keep = max(min_keep, min(raw_keep, Hq))
+            snapped = (raw_keep // step) * step
+            if snapped < min_keep:
+                snapped = min_keep
+            if snapped > Hq:
+                snapped = Hq
+    
+            # final guard: GQA groups integer
+            if snapped % Hkv != 0:
+                snapped = (snapped // Hkv) * Hkv
+                snapped = max(min_keep, min(snapped, Hq))
+    
+            return snapped
+    
+        def _snap_groups(G: int, raw_keep: int, cfg) -> int:
+            """
+            Snap number of kept FFN groups.
+            """
+            min_by_ratio = int(math.ceil(cfg.min_keep_ratio * G))
+            min_by_floor = int(cfg.floor_groups)
+            min_keep = max(1, min_by_ratio, min_by_floor)
+    
+            step = max(1, int(cfg.multiple_groups))
+    
+            raw_keep = max(min_keep, min(raw_keep, G))
+            snapped = (raw_keep // step) * step
+            if snapped < min_keep:
+                snapped = min_keep
+            if snapped > G:
+                snapped = G
+            return snapped
+    
+        def _normalize_scores(x: torch.Tensor) -> torch.Tensor:
+            """
+            Normalize logits for stable ranking (optional but helps when range is tiny).
+            """
+            if x.numel() == 0:
+                return x
+            mean = x.mean()
+            std = x.std()
+            if float(std) < 1e-6:
+                return x - mean
+            return (x - mean) / std
+    
+        # -------------------------------------------------------------------------
+        # Main loop over layers
+        # -------------------------------------------------------------------------
         for li, layer in enumerate(layers):
-            # ---- Attention (Q heads) ----
+            # ====================== ATTENTION PRUNING ============================
             attn = layer.self_attn
+    
             if isinstance(attn, GatedSelfAttentionLLM):
                 gat = attn
                 base = gat.base_attn
-
+    
                 Hq  = int(gat.num_q_heads)
                 Hkv = int(gat.num_kv_heads)
                 Dh  = int(gat.head_dim)
-
+    
                 if warm:
+                    # keep all heads during warmup
                     keep_idx = torch.arange(Hq)
                 else:
-                    # Build a "per-head" proxy gate if base gate is per-channel.
                     base_logits = gat.head_gate.logits.detach().float().view(-1)
-                    tau = float(getattr(gat.head_gate, "tau", 1.0))
-
+    
+                    # per-head vs per-channel gate
                     if base_logits.numel() == Hq:
-                        # Native per-head gate: use as-is
+                        # per-head gate
                         proxy_gate = gat.head_gate
-                        keep_idx = keep_group_indices_from_gate(
+                        raw_keep_idx = keep_group_indices_from_gate(
                             proxy_gate, policy=policy, step=step, custom_rounding=head_rounding
                         )
+                        # use logits directly as scores
+                        scores = base_logits
                     elif base_logits.numel() == Hq * Dh:
-                        # Collapse per-channel → per-head (mean; or use .amax for stricter)
+                        # per-channel gate → average to per-head
                         per_head_logits = base_logits.view(Hq, Dh).mean(dim=1)
-
+    
                         class _PerHeadProxyGate:
                             def __init__(self, logits, tau):
                                 self.logits = logits
                                 self.tau = tau
                                 self.num_groups = logits.numel()
                                 self.group_size = 1
-
-                        proxy_gate = _PerHeadProxyGate(per_head_logits, tau)
-                        keep_idx = keep_group_indices_from_gate(
+    
+                        proxy_gate = _PerHeadProxyGate(per_head_logits, float(getattr(gat.head_gate, "tau", 1.0)))
+                        raw_keep_idx = keep_group_indices_from_gate(
                             proxy_gate, policy=policy, step=step, custom_rounding=head_rounding
                         )
+                        scores = per_head_logits
                     else:
                         raise RuntimeError(
-                            f"Unexpected HeadGate logits len {base_logits.numel()} vs H={Hq} or H*Dh={Hq*Dh}"
+                            f"[export_pruned] Unexpected HeadGate logits len {base_logits.numel()} "
+                            f"vs H={Hq} or H*Dh={Hq*Dh}"
                         )
-
-                    # Enforce LCM with GQA (Hkv) via truncation to floor-multiple
-                    def _lcm(a: int, b: int) -> int:
-                        import math
-                        return abs(a * b) // math.gcd(max(a, 1), max(b, 1)) if a > 0 and b > 0 else max(a, b, 1)
-
-                    pol_mult = getattr(head_rounding, "multiple_groups", 1)
-                    snap = _lcm(int(pol_mult), max(1, Hkv))
-                    if keep_idx.numel() % snap != 0:
-                        k = (keep_idx.numel() // snap) * snap
-                        k = max(snap, min(Hq, k))
-                        # recompute top-k by per-head logits (ensure same criterion used above)
-                        if base_logits.numel() == Hq * Dh:
-                            scores = per_head_logits
-                        else:
-                            scores = base_logits
-                        keep_idx = torch.topk(scores, k=k, largest=True).indices.sort().values
-
-
+    
+                    # If gate helper returns everything, we still consider Hq as raw_keep
+                    raw_keep = int(raw_keep_idx.numel())
+                    H_keep = _snap_heads(Hq, raw_keep, Hkv, head_rounding)
+    
+                    # Normalize scores for a sharper top-k
+                    scores = _normalize_scores(scores)
+    
+                    # Recompute final keep_idx as top-k by scores
+                    k = int(H_keep)
+                    keep_idx = torch.topk(scores, k=k, largest=True).indices.sort().values
+    
+                    # ---- DEBUG LOGGING (optional) ----
+                    if step % 50 == 0 and li < 16:  # you can tweak this condition
+                        print(
+                            f"[DEBUG L{li}] Hq={Hq}, raw_keep={raw_keep}, snapped={H_keep}, "
+                            f"min_logit={float(scores.min()):.4f}, max_logit={float(scores.max()):.4f}"
+                        )
+    
                 H_keep = int(keep_idx.numel())
+                assert H_keep > 0, f"[export_pruned] H_keep=0 at layer {li}"
+                assert H_keep % Hkv == 0, f"[export_pruned] H_keep={H_keep} not divisible by Hkv={Hkv} at layer {li}"
+    
                 # channels for q/o slicing
-                ch_idx = torch.cat([torch.arange(h * Dh, (h + 1) * Dh) for h in keep_idx]).long()
-
-                # slice wrapper linears
+                ch_idx = torch.cat(
+                    [torch.arange(h * Dh, (h + 1) * Dh, dtype=torch.long) for h in keep_idx]
+                )
+    
+                # slice wrapper linears (q out, o in)
                 gat.q_proj = slice_linear(gat.q_proj, keep_out=ch_idx)
                 gat.o_proj = slice_linear(gat.o_proj, keep_in=ch_idx)
-
+    
                 # transplant into a clean HF attention
-                new_attn = copy.deepcopy(base)
+                new_attn = deepcopy(base)
                 if hasattr(new_attn, "q_proj"):
                     new_attn.q_proj = gat.q_proj
                 if hasattr(new_attn, "o_proj"):
                     new_attn.o_proj = gat.o_proj
                 elif hasattr(new_attn, "out_proj"):
                     new_attn.out_proj = gat.o_proj
-
+    
                 # update metadata
                 if hasattr(new_attn, "num_heads"):
                     new_attn.num_heads = int(H_keep)
@@ -524,32 +652,55 @@ class LlamaAdapter:
                     new_attn.num_key_value_heads = int(Hkv)
                 if hasattr(new_attn, "head_dim"):
                     new_attn.head_dim = int(Dh)
-                if hasattr(core.config, "hidden_size"):
-                    core.config.hidden_size = int(H_keep * Dh)
-
-                layer.self_attn = new_attn  # unwrap
-
-            # ---- MLP (SwiGLU grouped) ----
+                if hasattr(new_attn, "num_key_value_groups"):
+                    new_attn.num_key_value_groups = new_attn.num_heads // new_attn.num_key_value_heads
+    
+                # plug back
+                layer.self_attn = new_attn
+    
+            # ========================= MLP PRUNING ==============================
             mlp = layer.mlp
             g = getattr(mlp, "neuron_gate", None)
             if g is not None:
-                grp_idx = keep_group_indices_from_gate(
-                    g, policy=policy, step=step, custom_rounding=ffn_rounding,
+                # g is GroupGate over expansion dimension (e.g., 64 groups)
+                G = int(g.num_groups)
+                logits = g.logits.detach().float().view(-1)
+                logits = _normalize_scores(logits)
+    
+                raw_grp_idx = keep_group_indices_from_gate(
+                    g, policy=policy, step=step, custom_rounding=ffn_rounding
                 )
-                group = int(g.group_size)  # GroupGate exposes group_size
-                keep_exp = torch.cat([torch.arange(i * group, (i + 1) * group) for i in grp_idx]).long()
-
+                raw_keep_groups = int(raw_grp_idx.numel())
+                keep_groups = _snap_groups(G, raw_keep_groups, ffn_rounding)
+    
+                # final group indices as top-k by normalized logits
+                grp_scores = logits
+                grp_k = int(keep_groups)
+                grp_idx = torch.topk(grp_scores, k=grp_k, largest=True).indices.sort().values
+    
+                group_size = int(g.group_size)
+                keep_exp = torch.cat(
+                    [torch.arange(i * group_size, (i + 1) * group_size, dtype=torch.long) for i in grp_idx]
+                )
+    
+                # slice SwiGLU projections
                 mlp.up_proj   = slice_linear(mlp.up_proj,   keep_out=keep_exp)
                 mlp.gate_proj = slice_linear(mlp.gate_proj, keep_out=keep_exp)
                 mlp.down_proj = slice_linear(mlp.down_proj, keep_in=keep_exp)
-
+    
                 # Restore clean forward & drop gate
                 if hasattr(mlp, "_orig_forward"):
                     mlp.forward = mlp._orig_forward
                     delattr(mlp, "_orig_forward")
                 if hasattr(mlp, "neuron_gate"):
                     delattr(mlp, "neuron_gate")
-
+    
+                # ---- DEBUG LOGGING (optional) ----
+                if step % 50 == 0 and li < 16:
+                    print(
+                        f"[DEBUG L{li}] FFN groups: initial G={G}, raw_keep={raw_keep_groups}, snapped={keep_groups}"
+                    )
+    
         return slim
 
 
@@ -562,6 +713,7 @@ class LlamaExportPolicy:
     warmup_steps: int = 0
     head_rounding: CoreRounding = CoreRounding()  # e.g., CoreRounding(floor=8, multiple=8)
     ffn_rounding:  CoreRounding = CoreRounding()  # e.g., CoreRounding(min_keep_ratio=0.8, multiple=32)
+    q_rounding:    CoreRounding = CoreRounding()
 
 
 # -------------------------------------------------------------------------
@@ -872,59 +1024,525 @@ class LatencyProxyLLM(LatencyProxy):
 
 
 # ------------------------------------------------------------
-# Calibration helpers for LLM
+# Wrapper to mimic HF
 # ------------------------------------------------------------
-@torch.inference_mode()
-def calibrate_proxy_llm(
-    proxy: LatencyProxyLLM,
-    model: nn.Module,
-    *,
-    B: int,
-    S: int,
-    T: int,
-    export_keepall_fn,
-    device: str = "cuda",
-    warmup: int = 10,
-    iters: int = 30,
-) -> float:
+
+
+
+class SlimLlamaModel(nn.Module):
+    def __init__(self, config: LlamaConfig, layer_meta):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                SlimLlamaDecoderLayer(config, Hq=meta["Hq"], d_ff=meta["d_ff"])
+                for meta in layer_meta
+            ]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        cache_position=None,
+    ):
+        # Very similar to HF's LlamaModel.forward, but we pass layer_meta-driven modules.
+        if input_ids is None:
+            raise ValueError("input_ids required")
+
+        bsz, seq_len = input_ids.shape
+        hidden_states = self.embed_tokens(input_ids)
+
+        # Build causal mask + attention mask once (you already do this in your profiler)
+        causal_mask = attention_mask  # reuse your existing mask building
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_past_key_values = () if use_cache else None
+
+        # rotary precompute
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            past_kv = past_key_values[layer_idx] if past_key_values is not None else None
+
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_kv,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_past_key_values += (layer_outputs[1],)
+            if output_attentions:
+                all_self_attns += (layer_outputs[-1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        if not return_dict:
+            outputs = (hidden_states,)
+            if use_cache:
+                outputs += (next_past_key_values,)
+            if output_hidden_states:
+                outputs += (all_hidden_states,)
+            if output_attentions:
+                outputs += (all_self_attns,)
+            return outputs
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+
+class SlimLlamaForCausalLM(PreTrainedModel):
+    config_class = LlamaConfig  # reuse
+
+    def __init__(self, config: LlamaConfig, layer_meta):
+        super().__init__(config)
+        self.model = SlimLlamaModel(config, layer_meta)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+        
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, new_emb):
+        self.model.embed_tokens = new_emb
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_lm_head):
+        self.lm_head = new_lm_head
+        
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        labels=None,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        past_key_values=None,
+        cache_position=None,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        else:
+            loss = None
+
+        if not return_dict:
+            out = (logits,) + outputs[1:]
+            return ((loss,) + out) if loss is not None else out
+
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+
+class SlimLlamaSdpaAttention(nn.Module):
+    def __init__(self, config: LlamaConfig, Hq: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads  # 64
+        # num_heads is derived from pruned q size:
+        self.num_heads = Hq // self.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        self.q_proj = nn.Linear(self.hidden_size, Hq, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(Hq, self.hidden_size, bias=False)
+
+        # rotary stays same
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.attention_dropout = config.attention_dropout
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: torch.Tensor | None = None,
+    ):
+        bsz, q_len, _ = hidden_states.size()
+
+        q = self.q_proj(hidden_states)                     # (B, T, Hq)
+        k = self.k_proj(hidden_states)                     # (B, T, n_kv * d)
+        v = self.v_proj(hidden_states)
+
+        # (B, T, n_heads, d)
+        q = q.view(bsz, q_len, self.num_heads, self.head_dim)
+        # (B, T, n_kv, d)
+        k = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # transpose to (B, n_heads, T, d)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # rotary
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(v, position_ids)
+        else:
+            cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # group query attention: repeat kv heads
+        if self.num_key_value_groups > 1:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+
+        # causal_mask = attention_mask  # you already pass combined mask from LlamaModel
+        # if causal_mask is not None and not (
+        #     causal_mask.dtype.is_floating_point or causal_mask.dtype == torch.bool
+        # ):
+        #     causal_mask = causal_mask.to(dtype=q.dtype)
+
+        causal_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                # attention_mask: (B, S) with 1 for tokens, 0 for pads
+                # -> (B, 1, 1, S) additive mask 0 / -inf
+                causal_mask = attention_mask[:, None, None, :].to(q.dtype)
+                causal_mask = (1.0 - causal_mask) * torch.finfo(q.dtype).min
+            elif attention_mask.dim() == 4:
+                # already a 4D mask, just cast to q.dtype
+                causal_mask = attention_mask.to(q.dtype)
+            else:
+                raise ValueError(
+                    f"Unsupported attention_mask dim={attention_mask.dim()} "
+                    "for SlimLlamaSdpaAttention"
+                )
+            
+        
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=causal_mask is None,
+        )                                              # (B, n_heads, T, d)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)  # (B, T, Hq)
+        attn_output = self.o_proj(attn_output)                                      # (B, T, hidden_size)
+
+        outputs = (attn_output, None, None)
+        if use_cache:
+            # re-use HF's cache format: (k, v)
+            present_key_value = (k, v)
+            outputs = outputs + (present_key_value,)
+        if output_attentions:
+            raise NotImplementedError("attn weights not wired, but easy to add if needed")
+
+        return outputs
+
+
+
+class SlimLlamaMLP(nn.Module):
+    def __init__(self, config: LlamaConfig, d_ff: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = d_ff
+
+        self.gate_proj = nn.Linear(self.hidden_size, d_ff, bias=False)
+        self.up_proj   = nn.Linear(self.hidden_size, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, self.hidden_size, bias=False)
+
+        self.act_fn = nn.SiLU()  # Llama uses SiLU
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+
+
+class SlimLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, Hq: int, d_ff: int):
+        super().__init__()
+        self.self_attn = SlimLlamaSdpaAttention(config, Hq=Hq)
+        self.mlp = SlimLlamaMLP(config, d_ff=d_ff)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn_outputs = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + attn_outputs[0]
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs = outputs + (attn_outputs[2],)  # present_key_value
+        if output_attentions:
+            outputs = outputs + (attn_outputs[1],)
+        return outputs
+
+
+
+
+class SlimLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, Hq: int, d_ff: int):
+        super().__init__()
+        self.self_attn = SlimLlamaSdpaAttention(config, Hq=Hq)
+        self.mlp = SlimLlamaMLP(config, d_ff=d_ff)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn_outputs = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + attn_outputs[0]
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs = outputs + (attn_outputs[2],)  # present_key_value
+        if output_attentions:
+            outputs = outputs + (attn_outputs[1],)
+        return outputs
+
+
+
+
+
+def load_slim_llama(slim_dir: str, dense_id: str, device="cuda"):
+    config = AutoConfig.from_pretrained(dense_id)
+    with open(os.path.join(slim_dir, "slim_meta.json"), "r") as f:
+        layer_meta = json.load(f)
+
+    model = SlimLlamaForCausalLM(config, layer_meta)
+    slim = torch.load(os.path.join(slim_dir, "slim.pt"), map_location="cpu", weights_only=False)
+
+    try:
+        missing, unexpected = model.load_state_dict(slim, strict=False)
+        print("missing:", missing)
+        print("unexpected:", unexpected)
+    except Exception as e:
+        print("Unable to load as state_dict, trying to load as full model...")
+
+        state_dict = slim.state_dict()
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print("missing:", missing)
+        print("unexpected:", unexpected)
+        
+        
+    return model.to(device).eval()
+
+
+
+
+def infer_slim_meta(slim_pt_path: str, output_json: str = None):
     """
-    Calibrate proxy.scale_ms so proxy.predict(...) matches real keep-all latency for (B,S,T).
-    Returns the measured real mean latency in ms.
+    Infer per-layer slim metadata (Hq and d_ff) from slim.pt.
+    Produces a list like:
+      [{"Hq": 1536, "d_ff": 4096}, ...]
     """
-    keepall = export_keepall_fn(model).to(device).eval()
 
-    # Measure real latency (prefill + decode)
-    from core.measure import measure_latency_text_ms as _measure  # adjust if your path differs
-    real_ms, _ = _measure(keepall, B=B, S=S, T=T, warmup=warmup, iters=iters, device=device)
+    print(f"[load] slim state_dict: {slim_pt_path}")
+    sd = torch.load(slim_pt_path, map_location="cpu", weights_only=False)
 
-    # Soft/proxy latency on *gated* model
-    ms_like = proxy.predict(model, B=B, S=S, T=T)
-    soft_ms = float(ms_like.detach().item()) if torch.is_tensor(ms_like) else float(ms_like)
+    # Detect prefix (model.layers or layers)
+    prefixes = []
+    for k in sd.keys():
+        if k.startswith("model.layers."):
+            prefixes.append("model.layers")
+            break
+        if k.startswith("layers."):
+            prefixes.append("layers")
+            break
+    if not prefixes:
+        raise RuntimeError("Cannot find layer prefix (model.layers or layers) in slim.pt")
 
-    proxy.scale_ms = float(real_ms / max(soft_ms, 1e-9))
-    return real_ms
+    prefix = prefixes[0]
+    print(f"[info] detected prefix: '{prefix}'")
+
+    # Find number of layers
+    layer_ids = set()
+    layer_pat = re.compile(rf"^{prefix}\.(\d+)\.")
+    for k in sd.keys():
+        m = layer_pat.match(k)
+        if m:
+            layer_ids.add(int(m.group(1)))
+
+    if not layer_ids:
+        raise RuntimeError("Could not infer number of layers from slim state_dict")
+
+    num_layers = max(layer_ids) + 1
+    print(f"[info] detected num_layers = {num_layers}")
+
+    layer_meta = []
+
+    for layer in range(num_layers):
+        base = f"{prefix}.{layer}"
+
+        # --- Infer attention head count ---
+        qw = sd.get(f"{base}.self_attn.q_proj.weight", None)
+        if qw is None:
+            raise RuntimeError(f"Missing q_proj at layer {layer}")
+
+        Hq = qw.shape[0]      # q_proj.out_features
+        # But this is channels = Hq; in LLaMA: Hq = num_heads * head_dim
+
+        # --- Infer FFN expansion ---
+        up = sd.get(f"{base}.mlp.up_proj.weight", None)
+        if up is None:
+            raise RuntimeError(f"Missing mlp.up_proj at layer {layer}")
+
+        d_ff = up.shape[0]    # up_proj.out_features
+
+        layer_meta.append({
+            "Hq": int(Hq),
+            "d_ff": int(d_ff)
+        })
+
+        print(f"[L{layer}] Hq={Hq}, d_ff={d_ff}")
+
+    # Save
+    if output_json is None:
+        output_json = os.path.join(os.path.dirname(slim_pt_path), "slim_meta.json")
+
+    with open(output_json, "w") as f:
+        json.dump(layer_meta, f, indent=2)
+
+    print(f"[save] wrote {output_json}")
+    return layer_meta
 
 
-@torch.inference_mode()
-def calibrate_proxy_llm_from_batch(
-    proxy: LatencyProxyLLM,
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    *,
-    T: int,
-    export_keepall_fn,
-    device: str = "cuda",
-    warmup: int = 10,
-    iters: int = 30,
-) -> Tuple[int, int, int, float]:
+
+def load_slim_for_finetune(
+    dense_id: str,
+    slim_dir: str,
+    device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.bfloat16,
+) -> SlimLlamaForCausalLM:
     """
-    Infers (B,S) from a batch like {'input_ids': [B,S], ...},
-    calibrates for (B,S,T), and returns (B,S,T, real_ms).
+    Load a pruned slim model (slim.pt) into a SlimLlamaForCausalLM instance
+    that is ready for training / fine-tuning.
     """
-    input_ids = batch["input_ids"]
-    B, S = int(input_ids.size(0)), int(input_ids.size(1))
-    ms = calibrate_proxy_llm(
-        proxy, model, B=B, S=S, T=T, export_keepall_fn=export_keepall_fn,
-        device=device, warmup=warmup, iters=iters
+
+    # 1. Load dense base config + weights (we use it as a template)
+    dense = AutoModelForCausalLM.from_pretrained(
+        dense_id,
+        torch_dtype=dtype,
     )
-    return B, S, T, ms
+
+    # 4. Build SlimLlamaForCausalLM with pruned modules + slim weights
+    slim = load_slim_llama(slim_dir, dense_id, device=device)
+
+
+    # 5. Make sure training-ish flags are sane
+    slim.config.use_cache = False          # we don’t want cache during training
+    slim.config._attn_implementation = "sdpa"  # consistent with our forward
+    slim.to(device)
+    slim.train()
+
+    return slim

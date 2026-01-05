@@ -113,6 +113,7 @@ def finetune_student(
     get_student_logits: Callable[[nn.Module, torch.Tensor], torch.Tensor],
     get_teacher_logits: Callable[[nn.Module, torch.Tensor], torch.Tensor],
     cfg: FinetuneConfig = FinetuneConfig(),
+    task_loss = None,
     val_loader=None,
     on_step: Optional[Callable[[int, float], None]] = None,
     save_best=False
@@ -184,6 +185,8 @@ def finetune_student(
             s32 = s.float()
             mse = cfg.mse_weight*mse_reg(s32, t, kd_conf.temperature)
             loss = kd_loss(s32, t, kd_conf) + mse
+            if task_loss is not None:
+                loss += task_loss
 
             opt.zero_grad(set_to_none=True)
             if use_scaler:

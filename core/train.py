@@ -140,6 +140,7 @@ class LagrangeTrainer:
 
     # ---- training -------------------------------------------------------------
     def train_epoch(self, loader, *, real_policy=None, verbose_every: int = 50):
+
         device = self.cfg.device
         self.student.train().to(device)
         self.teacher.to(device).eval()
@@ -148,9 +149,11 @@ class LagrangeTrainer:
         seen = 0
         lam_real = self.lambda_
 
-        total_steps = len(loader)
-
-    
+        if hasattr(loader, 'len'):
+            total_steps = len(loader)
+        else:
+            total_steps = 1         
+        
         for step, batch in enumerate(loader, 1):
             # Move batch to device in a type-safe way
             batch = _move_batch_to_device(batch, device)
@@ -234,7 +237,7 @@ class LagrangeTrainer:
             if self.cfg.real_probe_every and (step % int(self.cfg.real_probe_every) == 0):
                 # Build a probe shape for latency func if needed
                 try:
-                    from core.measure import measure_latency_text_ms  # text-friendly
+                    from core.profiler import measure_latency_text_ms  # text-friendly
                     if isinstance(batch, dict) and "input_ids" in batch and torch.is_tensor(batch["input_ids"]):
                         B, S = int(batch["input_ids"].size(0)), int(batch["input_ids"].size(1))
                     else:
@@ -242,27 +245,31 @@ class LagrangeTrainer:
                         x0 = batch["input_ids"] if isinstance(batch, dict) else (batch[0] if isinstance(batch, (tuple, list)) else batch)
                         B = int(x0.size(0)); S = int(x0.size(1))
                     slim = self.export_pruned(self.student, real_policy or self.export_policy, step)
-                    mean_ms, p95_ms = measure_latency_text_ms(slim, B=B, S=S, T=128, device=device)
+                    mean_ms, p95_ms, std = measure_latency_text_ms(slim, B=B, S=S, T=128, device=device)
+                    del slim
+                    
                 except Exception:
                     # If the project has a different profiler, retain compatibility:
                     from .profiler import measure_latency_ms
                     x0 = batch["input_ids"] if isinstance(batch, dict) else (batch[0] if isinstance(batch, (tuple, list)) else batch)
                     shape = (int(x0.size(0)), *list(x0.shape[1:]))
                     slim = self.export_pruned(self.student, real_policy or self.export_policy, step)
-                    mean_ms, p95_ms = measure_latency_ms(slim, shape, device=device)
+                    mean_ms, p95_ms, std = measure_latency_ms(slim, shape, device=device)
+                    del slim
     
                 with torch.no_grad():
                     lam_real = max(0.0, self.lambda_ + self.cfg.dual.lr * (mean_ms - self.cfg.latency_target_ms))
 
                 # scale_correction = mean_ms / max(1e-9, o1_ms.detach())
+                # self.proxy.inner.scale_ms = 0.9 * self.proxy.inner.scale_ms + 0.1 * scale_correction * self.proxy.inner.scale_ms
                 # self.proxy.cfg.scale_ms = 0.9 * self.proxy.cfg.scale_ms + 0.1 * scale_correction * self.proxy.cfg.scale_ms
 
     
                 if (step % verbose_every) == 0:
                     print(
-                        f"Step {step}/{len(loader)} | KL={float(loss_w.item()):.6f} | MSE={float(mse.item()):.6f} | "
+                        f"Step {step}/{total_steps} | KL={float(loss_w.item()):.6f} | MSE={float(mse.item()):.6f} | "
                         f"Gate={float(loss_g.item()):.6f} | "
-                        f"proxy={float(o1_ms.detach()):.3f}ms | real_mean={mean_ms:.3f}ms p95={p95_ms:.3f}ms | λ={self.lambda_:.6f}"
+                        f"proxy={float(o1_ms.detach()):.3f}ms | real={mean_ms:.3f}ms p95={p95_ms:.3f}ms | std={std:.3f} |λ={self.lambda_:.6f}"
                     )
     
             running += float(loss_g.detach())
@@ -271,6 +278,9 @@ class LagrangeTrainer:
             del s_logits, t_logits, o1_ms, kd_g, reg, loss_g, loss_w
             torch.cuda.empty_cache()
             gc.collect()
+
+            if step > 100:
+                break
     
         print(f"Epoch loss {running / max(1, seen):.6f}")
         return self.lambda_
