@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 # NOTE: absolute imports so running `-m examples.run_vit_optimize` works without package install
-from core.gates import HeadGate, GroupGate, _as_like
+from core.gates import HeadGate, GroupGate
 from core.export import (
     ExportPolicy as CoreExportPolicy,
     Rounding as CoreRounding,
@@ -38,6 +38,7 @@ from core.export import (
 from core.utils import deepcopy_eval_cpu
 from core.search_export import grid_search_latency
 from core.proxy_cost import LatencyProxy, LatencyLUT, _first_tensor
+from core.gates import _as_like
 
 # -----------------------------------------------------------------------------
 # Config
@@ -393,20 +394,6 @@ class ViTProxyConfig:
     alpha_out: float = 1.0
     alpha_mlp: float = 1.0
 
-
-# ---- helpers -------------------------------------------------------------
-
-
-def _vit_layers(m):
-    enc = getattr(m, "encoder", None)
-    if enc is not None and hasattr(enc, "layer"):
-        return enc.layer
-    vit = getattr(m, "vit", None)
-    if vit is not None and hasattr(vit, "encoder") and hasattr(vit.encoder, "layer"):
-        return vit.encoder.layer
-    raise TypeError("Expected a HF ViT with *.encoder.layer (ViTModel or ViTForImageClassification).")            
-
-    
 class ViTLatencyProxy(LatencyProxy):
     """Latency proxy for ViT models. Accepts batches or (N,C,H,W) tuples."""
 
@@ -415,6 +402,7 @@ class ViTLatencyProxy(LatencyProxy):
         self.cfg = cfg or ViTProxyConfig()
         self.lut = lut or LatencyLUT()
 
+    # ---- helpers -------------------------------------------------------------
     @staticmethod
     def _input_spec(sample: TensorOrBatch) -> Tuple[int, int, int]:
         if isinstance(sample, (tuple, list)) and len(sample) == 4 and all(isinstance(x, int) for x in sample):
@@ -426,6 +414,15 @@ class ViTLatencyProxy(LatencyProxy):
         B, C, H, W = x.shape
         return int(B), int(H), int(W)
 
+    @staticmethod
+    def _vit_layers(m):
+        enc = getattr(m, "encoder", None)
+        if enc is not None and hasattr(enc, "layer"):
+            return enc.layer
+        vit = getattr(m, "vit", None)
+        if vit is not None and hasattr(vit, "encoder") and hasattr(vit.encoder, "layer"):
+            return vit.encoder.layer
+        raise TypeError("Expected a HF ViT with *.encoder.layer (ViTModel or ViTForImageClassification).")            
 
     @staticmethod
     def _patch_hw(cfg) -> Tuple[int, int]:
@@ -457,8 +454,7 @@ class ViTLatencyProxy(LatencyProxy):
             if hasattr(m, "logits") and hasattr(m, "tau"):
                 return m
         return None
-    
-        
+
     # ---- proxy ---------------------------------------------------------------
     def _predict_raw(
         self,
@@ -492,7 +488,7 @@ class ViTLatencyProxy(LatencyProxy):
 
         default_hidden = _as_like(anchor, int(getattr(cfg, "intermediate_size", 4 * int(D))))
 
-        layers = _vit_layers(model)
+        layers = self._vit_layers(model)
         for blk in layers:
             heads_soft = Hh if warm else (self._soft_heads_from_block(blk) or Hh)
 

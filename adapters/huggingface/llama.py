@@ -1448,7 +1448,7 @@ def infer_slim_meta(slim_pt_path: str, output_json: str = None):
     """
 
     print(f"[load] slim state_dict: {slim_pt_path}")
-    sd = torch.load(slim_pt_path, map_location="cpu")
+    sd = torch.load(slim_pt_path, map_location="cpu", weights_only=False)
 
     # Detect prefix (model.layers or layers)
     prefixes = []

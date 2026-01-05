@@ -1,3 +1,5 @@
 torch
 torchvision
-transformers==4.44.1
+transformers==4.57.3 # for Llama
+# transformers==4.44.1 # for ViT
+datasets

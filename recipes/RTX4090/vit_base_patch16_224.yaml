@@ -1,0 +1,108 @@
+# Recipe: google/vit-base-patch16-224 → hardware-aware slim
+
+base_model: google/vit-base-patch16-224
+model: hawada/vit-base-patch16-224-in1k
+
+target_gpu: NVIDIA-RTX4090
+
+latency:
+  # target_ms: 28.0
+  probe:
+    warmup: 10
+    iters: 30
+    every_steps: 200
+
+proxy:
+  family: ViT
+  vit:
+    scale_ms: 1.0
+    alpha_qkv: 1.0
+    alpha_scores: 1.0
+    alpha_out: 1.0
+    alpha_mlp: 1.0
+
+adapter:
+  vit_gating:
+    tau: 1.5
+    init_logit: 3.0
+    head_gating: true
+    ffn_group: 16
+    ffn_gating: true
+    hard_eval: true
+
+export:
+  warmup_steps: 150
+  # grid_multiple_groups: [2,3,4,5] # [2, 3, 4, 5, 6, 7, 8]
+  search:
+    grid_multiple_groups: [2, 3, 4, 5]
+    ffn_snaps: [1, 8, 16]
+
+
+# trainer:
+#   amp: false
+#   use_grad_scaler: false
+#   gate_warmup_steps: 0
+#   mse_weight: 0.1
+#   early_stopping_patience: 3
+#   early_stopping_lambda: 1e-5
+#   kd:
+#     temperature: 4.0
+#     alpha: 2.0
+#   lagrange:
+#     real_every: 50         # measure real latency every N steps (export-eval policy)
+#     lr_gate: 4.0e-3        
+#     lr_weight: 5.0e-5
+#     lr_linear: 1.0e-4
+#     lr_affine: 3.0e-4
+#     wd_linear: 1.0e-4    
+#     min_keep_ratio: 0.9    # floor during training/export
+#     sparsity_reg: 1.0e-4
+#     tau_target_scale: 0.9  # target = tau_target_scale * keep-all latency
+    
+trainer:
+  amp: true
+  device: cuda
+  probe_batch_override: 64
+  mse_weight: 0.1
+  early_stopping_patience: 3
+  early_stopping_lambda: 1e-5  
+  lr_gate: 5.0e-3
+  lr_linear: 1.0e-4
+  lr_affine: 3.0e-4
+  wd_linear: 1.0e-4
+  kd:
+    temperature: 4.0
+    alpha: 2.0
+  penalties:
+    l0: 0.01                 # encourage sparsity
+    keep_floor_ratio: 0.5 
+    bimodality: 1.0e-6
+  constraints:
+    min_keep_ratio: 0.25     # hard projection floor
+    min_groups: 1
+  lagrange:
+    real_every: 200         # measure real latency every N steps (export-eval policy)
+    lr_gate: 1.0e-4        
+    lr_weight: 5.0e-4
+    lr_linear: 1.0e-4
+    lr_affine: 3.0e-4
+    wd_linear: 1.0e-4    
+    tau_target_scale: 0.6  # target = tau_target_scale * keep-all latency
+
+
+# Data paths: replace with your local folders
+
+data:
+  train_root: /data/imagenet100-224/train
+  # val_root: /data/imagenet100-224/val
+  img_size: 224
+  batch_size: 64
+  workers: 8
+  #limit_train: 2048   # for quick runs; remove for full dataset
+  # limit_val: 256
+
+# Fine tuning after pruning
+finetune:
+  epochs: 20
+  lr: 1e-4
+  wd: 5e-3

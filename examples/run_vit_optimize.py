@@ -267,7 +267,7 @@ def main():
     
         # Save artifacts
         # torch.save(slim.state_dict(), os.path.join(args.outdir, "vit_slim.pth"))
-        torch.save(slim, os.path.join(args.outdir, "vit_slim.pth"))
+        torch.save(slim, os.path.join(args.outdir, "vit_slim.pth"))        
         torch.save(student.state_dict(), os.path.join(args.outdir, "vit_gated.pth"))
     
         print(f"Saved pruned model to {os.path.join(args.outdir, 'vit_slim.pth')}")
@@ -278,35 +278,36 @@ def main():
         # print("[load] gated missing:", missing)
         # print("[load] gated unexpected:", unexpected)    
         slim = torch.load(args.slim, map_location=device, weights_only=False)
+        
         print(f"Skipping training. Pruned model loaded from {args.slim}. [To run with training, drop '--slim' argument]")
 
-    if args.finetune is True:
-        # --- Fine-tune the selected slim model against the teacher ---
-        ft_epochs = int(pack["recipe"].get("finetune", {}).get("epochs", 5))
-        print(f"\nStarting fine tuning for {ft_epochs} epochs...")
+    # if args.finetune is True:
+    #     # --- Fine-tune the selected slim model against the teacher ---
+    #     ft_epochs = int(pack["recipe"].get("finetune", {}).get("epochs", 5))
+    #     print(f"\nStarting fine tuning for {ft_epochs} epochs...")
         
-        ft_cfg = FinetuneConfig(
-            epochs=ft_epochs,
-            lr=float(pack["recipe"].get("finetune", {}).get("lr", 3e-4)),
-            kd=KDConfig(**pack["recipe"].get("trainer", {}).get("kd", {})),
-            amp=bool(pack["recipe"].get("trainer", {}).get("amp", True)),
-            device=pack["device"],
-            log_every=200,
-        )
-        slim = finetune_student(
-            slim,
-            teacher,
-            pack["train_loader"],
-            get_student_logits=pack["get_s"],
-            get_teacher_logits=pack["get_t"],
-            cfg=ft_cfg,
-            val_loader=pack["val_loader"],
-            save_best=True
-        )
-        torch.save(slim, os.path.join(args.outdir, "vit_slim_finetune.pth"))
+    #     ft_cfg = FinetuneConfig(
+    #         epochs=ft_epochs,
+    #         lr=float(pack["recipe"].get("finetune", {}).get("lr", 3e-4)),
+    #         kd=KDConfig(**pack["recipe"].get("trainer", {}).get("kd", {})),
+    #         amp=bool(pack["recipe"].get("trainer", {}).get("amp", True)),
+    #         device=pack["device"],
+    #         log_every=200,
+    #     )
+    #     slim = finetune_student(
+    #         slim,
+    #         teacher,
+    #         pack["train_loader"],
+    #         get_student_logits=pack["get_s"],
+    #         get_teacher_logits=pack["get_t"],
+    #         cfg=ft_cfg,
+    #         val_loader=pack["val_loader"],
+    #         save_best=True
+    #     )
+    #     torch.save(slim, os.path.join(args.outdir, "vit_slim_finetune.pth"))
         
-    else:
-        print("Skipping fine-tuning. [To run fine-tuning, set '--finetuning True' or omit this argument]")
+    # else:
+    #     print("Skipping fine-tuning. [To run fine-tuning, set '--finetuning True' or omit this argument]")
 
     print(f"\nStarting benchmarking with batch size = {B}...")
         
