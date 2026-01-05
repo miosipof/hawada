@@ -554,6 +554,3 @@ class ViTLatencyProxy(LatencyProxy):
         soft_ms = self.predict(model, sample_t).item()
         self.cfg.scale_ms = float(mean_ms / max(soft_ms, 1e-9))
         return self.cfg.scale_ms    
-
-
-

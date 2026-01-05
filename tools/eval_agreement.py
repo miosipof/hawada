@@ -45,7 +45,7 @@ def _ns_from_recipe(recipe_path: str):
     )
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def _eval_loop(get_s, get_t, loader, batches: int, T: float, device: str):
     """
     Generic eval loop for single-logit-per-sample models (ViT / ResNet).
@@ -86,7 +86,7 @@ def _eval_loop(get_s, get_t, loader, batches: int, T: float, device: str):
     }
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def _eval_loop_llama(get_s, get_t, loader, batches: int, T: float, device: str):
     """
     Eval loop for autoregressive LMs (Llama).
