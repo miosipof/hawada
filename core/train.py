@@ -52,8 +52,8 @@ class DualConfig:
 class TrainerConfig:
     kd: KDConfig = field(default_factory=KDConfig)
     dual: DualConfig = field(default_factory=DualConfig)
-    penalties: PenaltyWeights = field(default_factory=lambda: PenaltyWeights(...))
-    constraints: Constraints = field(default_factory=lambda: Constraints(...))
+    penalties: PenaltyWeights = field(default_factory=PenaltyWeights)
+    constraints: Constraints = field(default_factory=Constraints)
 
     latency_target_ms: float = 30.0
     real_probe_every: int = 0        # steps; 0 disables real probes
