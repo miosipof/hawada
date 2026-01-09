@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys, pathlib
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import copy
@@ -336,8 +336,8 @@ class ViTAdapter:
 @dataclass
 class ViTExportPolicy:
     warmup_steps: int = 0
-    head_rounding: CoreRounding = CoreRounding()
-    ffn_rounding: CoreRounding = CoreRounding()
+    head_rounding: CoreRounding = field(default_factory=CoreRounding)
+    ffn_rounding:  CoreRounding = field(default_factory=CoreRounding)
 
 
 @dataclass

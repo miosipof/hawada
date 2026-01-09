@@ -15,7 +15,35 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# -----------------------------------------------------------------------------
+# YAML & batch helpers
+# -----------------------------------------------------------------------------
 
+def load_yaml(path: str) -> Dict[str, Any]:
+    import yaml
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+def _images_from_batch(batch):
+    # (images, labels) or [images, labels]
+    if isinstance(batch, (tuple, list)):
+        return batch[0]
+    # dict-style datasets
+    if isinstance(batch, dict):
+        for k in ("pixel_values", "images", "inputs"):
+            v = batch.get(k, None)
+            if torch.is_tensor(v):
+                return v
+        # fallback to first tensor value
+        for v in batch.values():
+            if torch.is_tensor(v):
+                return v
+        raise TypeError("Batch dict has no tensor-like image field")
+    # plain tensor
+    if torch.is_tensor(batch):
+        return batch
+    raise TypeError(f"Unsupported batch type for images: {type(batch)}")
+    
 # -----------------------------------------------------------------------------
 # Device / dtype helpers
 # -----------------------------------------------------------------------------

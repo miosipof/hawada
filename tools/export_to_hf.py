@@ -527,7 +527,7 @@ class StudentResNet(nn.Module):
 # Convenience
 def load_student(checkpoint_path, device='cpu', num_classes=1000):
     m = StudentResNet(num_classes=num_classes)
-    sd = torch.load(checkpoint_path, map_location=device)
+    sd = torch.load(checkpoint_path, map_location=device, weights_only=False)
     m.load_state_dict(sd, strict=False)
     return m
 """

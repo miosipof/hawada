@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys, pathlib
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence, Callable, Tuple
 
 import copy
@@ -711,9 +711,9 @@ class LlamaAdapter:
 @dataclass
 class LlamaExportPolicy:
     warmup_steps: int = 0
-    head_rounding: CoreRounding = CoreRounding()  # e.g., CoreRounding(floor=8, multiple=8)
-    ffn_rounding:  CoreRounding = CoreRounding()  # e.g., CoreRounding(min_keep_ratio=0.8, multiple=32)
-    q_rounding:    CoreRounding = CoreRounding()
+    head_rounding: CoreRounding = field(default_factory=CoreRounding)
+    ffn_rounding:  CoreRounding = field(default_factory=CoreRounding)
+    q_rounding:    CoreRounding = field(default_factory=CoreRounding)
 
 
 # -------------------------------------------------------------------------

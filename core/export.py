@@ -16,9 +16,8 @@ use these primitives to assemble a clean pruned model.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence, Tuple
-
 import torch
 import torch.nn as nn
 
@@ -56,7 +55,7 @@ class ExportPolicy:
     """
 
     warmup_steps: int = 0
-    rounding: Rounding = Rounding()
+    rounding: Rounding = field(default_factory=Rounding)
 
 
 def _round_down_mult(n: int, m: int) -> int:

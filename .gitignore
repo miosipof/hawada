@@ -2,5 +2,5 @@
 *.ipynb_checkpoints
 runs
 hf_export*
-notebooks*
+notebooks/ckpt
 *DS_Store
