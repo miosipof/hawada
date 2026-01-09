@@ -277,8 +277,8 @@ class LagrangeTrainer:
             torch.cuda.empty_cache()
             gc.collect()
 
-            if step > 100:
-                break
+            # if step > 100:
+            #     break
     
         print(f"Epoch loss {running / max(1, seen):.6f}")
         return self.lambda_
