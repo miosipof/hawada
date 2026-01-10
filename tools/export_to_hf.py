@@ -799,6 +799,105 @@ def export_vit_variants(
 
 # --- LLaMA export ------------------------------------------------------------
 
+# def export_llama_variants(
+#     base_id: str,
+#     student_ckpt: Path,
+#     slim_ckpt: Path,
+#     repo_gated: str,
+#     repo_slim: str,
+#     token: Optional[str],
+#     private: bool,
+#     include_code: List[str],
+#     push: bool = True,
+# ):
+#     api = HfApi(token=token)
+
+#     # Load base config & tokenizer (used as template)
+#     cfg = AutoConfig.from_pretrained(base_id, trust_remote_code=True)
+#     tok = AutoTokenizer.from_pretrained(base_id, use_fast=True)
+
+#     # -------------------------------------------------------------------------
+#     # (a) Gated student (custom code, state_dict only)
+#     # -------------------------------------------------------------------------
+#     gated_dir = Path("hf_export_gated_llama")
+#     if gated_dir.exists():
+#         shutil.rmtree(gated_dir)
+#     _ensure_dir(gated_dir)
+
+#     tok.save_pretrained(gated_dir)
+#     cfg.save_pretrained(gated_dir)
+
+#     obj_student = torch.load(student_ckpt, map_location="cpu", weights_only=False)
+
+#     # Normalize to pure state_dict for robustness
+#     if isinstance(obj_student, torch.nn.Module):
+#         sd_student = obj_student.state_dict()
+#     elif isinstance(obj_student, dict):
+#         # assume it's already a state_dict-like mapping
+#         sd_student = obj_student
+#     else:
+#         raise TypeError(
+#             f"[gated] Unexpected object type in {student_ckpt}: {type(obj_student)}. "
+#             "Expected nn.Module or state_dict-like dict."
+#         )
+
+#     torch.save(sd_student, gated_dir / "pytorch_model.bin")
+
+#     if include_code:
+#         _copy_code_tree(gated_dir, include_code)
+#         (gated_dir / "custom_code.py").write_text(
+#             "# Marker file so Hub shows 'custom code' banner for gated LLaMA.\n",
+#             encoding="utf-8",
+#         )
+
+#     _save_model_card_and_meta(
+#         gated_dir,
+#         title=repo_gated,
+#         task="causal-lm",
+#         meta={"base_id": base_id, "variant": "gated-student"},
+#         include_code=include_code,
+#         repo_slim=repo_slim,
+#     )
+
+#     if push:
+#         create_repo(repo_gated, token=token, private=private, exist_ok=True)
+#         upload_folder(repo_id=repo_gated, folder_path=str(gated_dir), token=token)
+#         print(f"[ok] Pushed gated LLaMA student → {repo_gated}")
+
+#     # -------------------------------------------------------------------------
+#     # (b) Slim model (HF-compatible SlimLlamaForCausalLM + custom code)
+#     # -------------------------------------------------------------------------
+#     slim_dir = Path("hf_export_slim_llama")
+#     if slim_dir.exists():
+#         shutil.rmtree(slim_dir)
+#     _ensure_dir(slim_dir)
+
+#     tok.save_pretrained(slim_dir)
+#     cfg.save_pretrained(slim_dir)
+
+#     # Load slim checkpoint: accept either full model or pure state_dict
+#     mdl = load_slim_llama(slim_ckpt, base_id, device="cpu")
+
+#     # # Build a base model then load the pruned weights
+#     # mdl = AutoModelForCausalLM.from_pretrained(
+#     #     base_id, torch_dtype="auto", trust_remote_code=True
+#     # )
+#     # missing, unexpected = mdl.load_state_dict(sd_slim, strict=False)
+#     # print(f"[slim] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+
+#     mdl.save_pretrained(slim_dir, safe_serialization=False)
+
+#     _save_model_card_and_meta(
+#         slim_dir, title=f"{repo_slim}", task="causal-lm",
+#         meta={"base_id": base_id, "variant": "slim-export"},
+#         include_code=[], repo_slim=repo_slim
+#     )
+
+#     if push:
+#         create_repo(repo_slim, token=token, private=private, exist_ok=True)
+#         upload_folder(repo_id=repo_slim, folder_path=str(slim_dir), token=token)
+#         print(f"[ok] Pushed slim student → {repo_slim}")
+
 def export_llama_variants(
     base_id: str,
     student_ckpt: Path,
@@ -812,7 +911,7 @@ def export_llama_variants(
 ):
     api = HfApi(token=token)
 
-    # Load base config & tokenizer (used as template)
+    # Base config & tokenizer (template)
     cfg = AutoConfig.from_pretrained(base_id, trust_remote_code=True)
     tok = AutoTokenizer.from_pretrained(base_id, use_fast=True)
 
@@ -829,11 +928,9 @@ def export_llama_variants(
 
     obj_student = torch.load(student_ckpt, map_location="cpu", weights_only=False)
 
-    # Normalize to pure state_dict for robustness
     if isinstance(obj_student, torch.nn.Module):
         sd_student = obj_student.state_dict()
     elif isinstance(obj_student, dict):
-        # assume it's already a state_dict-like mapping
         sd_student = obj_student
     else:
         raise TypeError(
@@ -873,30 +970,50 @@ def export_llama_variants(
     _ensure_dir(slim_dir)
 
     tok.save_pretrained(slim_dir)
-    cfg.save_pretrained(slim_dir)
 
-    # Load slim checkpoint: accept either full model or pure state_dict
+    # Use helper to build a proper SlimLlamaForCausalLM with config.layer_meta
     mdl = load_slim_llama(slim_ckpt, base_id, device="cpu")
 
-    # # Build a base model then load the pruned weights
-    # mdl = AutoModelForCausalLM.from_pretrained(
-    #     base_id, torch_dtype="auto", trust_remote_code=True
-    # )
-    # missing, unexpected = mdl.load_state_dict(sd_slim, strict=False)
-    # print(f"[slim] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+    # Its config now has layer_meta + auto_map
+    cfg_slim = mdl.config
+    cfg_slim.save_pretrained(slim_dir)
 
+    # Copy code needed for SlimLlamaForCausalLM & SlimLlamaModel
+    if include_code:
+        _copy_code_tree(slim_dir, include_code)
+        (slim_dir / "custom_code.py").write_text(
+            "# Marker file so Hub shows 'custom code' banner for slim LLaMA.\n",
+            encoding="utf-8",
+        )
+
+        # Optional convenience file: slim_llama.py at repo root
+        # so auto_map path 'slim_llama.SlimLlamaForCausalLM' works.
+        (slim_dir / "slim_llama.py").write_text(
+            "from adapters.huggingface.llama import SlimLlamaModel, SlimLlamaForCausalLM\n",
+            encoding="utf-8",
+        )
+
+    # Save weights (no safetensors needed, but you can turn it on)
     mdl.save_pretrained(slim_dir, safe_serialization=False)
 
     _save_model_card_and_meta(
-        slim_dir, title=f"{repo_slim}", task="causal-lm",
+        slim_dir,
+        title=repo_slim,
+        task="causal-lm",
         meta={"base_id": base_id, "variant": "slim-export"},
-        include_code=[], repo_slim=repo_slim
+        include_code=include_code,
+        repo_slim=repo_slim,
     )
 
     if push:
         create_repo(repo_slim, token=token, private=private, exist_ok=True)
         upload_folder(repo_id=repo_slim, folder_path=str(slim_dir), token=token)
         print(f"[ok] Pushed slim student → {repo_slim}")
+
+
+
+
+
 
 # --- ResNet export (custom code both variants) -------------------------------
 

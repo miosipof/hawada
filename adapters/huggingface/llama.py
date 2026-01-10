@@ -21,7 +21,7 @@ import sys, pathlib
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Callable, Tuple
+from typing import Optional, Sequence, Callable, Tuple, Dict, Any
 
 import copy
 from copy import deepcopy
@@ -35,13 +35,13 @@ import json
 import os
 import re
 
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
-
 from transformers import PreTrainedModel
 from transformers import AutoConfig, AutoModelForCausalLM
+
 
 # Core (absolute imports so running `-m examples.run_llama_optimize` works)
 from core.gates import HeadGate, GroupGate
@@ -1121,15 +1121,102 @@ class SlimLlamaModel(nn.Module):
         )
 
 
-class SlimLlamaForCausalLM(PreTrainedModel):
-    config_class = LlamaConfig  # reuse
+# class SlimLlamaForCausalLM(PreTrainedModel):
+#     config_class = LlamaConfig  # reuse
 
-    def __init__(self, config: LlamaConfig, layer_meta):
+#     def __init__(self, config: LlamaConfig, layer_meta):
+#         super().__init__(config)
+#         self.model = SlimLlamaModel(config, layer_meta)
+#         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+#         self.post_init()
+        
+#     def get_input_embeddings(self):
+#         return self.model.embed_tokens
+
+#     def set_input_embeddings(self, new_emb):
+#         self.model.embed_tokens = new_emb
+
+#     def get_output_embeddings(self):
+#         return self.lm_head
+
+#     def set_output_embeddings(self, new_lm_head):
+#         self.lm_head = new_lm_head
+        
+#     def forward(
+#         self,
+#         input_ids=None,
+#         attention_mask=None,
+#         position_ids=None,
+#         labels=None,
+#         use_cache=False,
+#         output_attentions=False,
+#         output_hidden_states=False,
+#         return_dict=True,
+#         past_key_values=None,
+#         cache_position=None,
+#     ):
+#         outputs = self.model(
+#             input_ids=input_ids,
+#             attention_mask=attention_mask,
+#             position_ids=position_ids,
+#             past_key_values=past_key_values,
+#             use_cache=use_cache,
+#             output_attentions=output_attentions,
+#             output_hidden_states=output_hidden_states,
+#             return_dict=return_dict,
+#             cache_position=cache_position,
+#         )
+
+#         hidden_states = outputs.last_hidden_state
+#         logits = self.lm_head(hidden_states)
+
+#         if labels is not None:
+#             shift_logits = logits[..., :-1, :].contiguous()
+#             shift_labels = labels[..., 1:].contiguous()
+#             loss_fct = nn.CrossEntropyLoss()
+#             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+#         else:
+#             loss = None
+
+#         if not return_dict:
+#             out = (logits,) + outputs[1:]
+#             return ((loss,) + out) if loss is not None else out
+
+#         from transformers.modeling_outputs import CausalLMOutputWithPast
+#         return CausalLMOutputWithPast(
+#             loss=loss,
+#             logits=logits,
+#             past_key_values=outputs.past_key_values,
+#             hidden_states=outputs.hidden_states,
+#             attentions=outputs.attentions,
+#         )
+
+
+class SlimLlamaForCausalLM(PreTrainedModel):
+    config_class = LlamaConfig  # reuse HF config
+
+
+    def __init__(self, config: LlamaConfig, layer_meta: Optional[list] = None):
+        # Make sure HF doesn't try to tie them automatically
+        config.tie_word_embeddings = False
         super().__init__(config)
+
+        if layer_meta is None:
+            layer_meta = getattr(config, "layer_meta", None)
+        if layer_meta is None:
+            raise ValueError("SlimLlamaForCausalLM requires `layer_meta`.")
+
         self.model = SlimLlamaModel(config, layer_meta)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
         self.post_init()
-        
+
+    def tie_weights(self):
+        # override to NO-OP: no shared tensor between embed and lm_head
+        return
+
+    # ----- Embedding helpers -----
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -1141,17 +1228,19 @@ class SlimLlamaForCausalLM(PreTrainedModel):
 
     def set_output_embeddings(self, new_lm_head):
         self.lm_head = new_lm_head
-        
+
+    # ----- Forward / Causal LM head -----
+
     def forward(
         self,
         input_ids=None,
         attention_mask=None,
         position_ids=None,
         labels=None,
-        use_cache=False,
-        output_attentions=False,
-        output_hidden_states=False,
-        return_dict=True,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
         past_key_values=None,
         cache_position=None,
     ):
@@ -1170,19 +1259,21 @@ class SlimLlamaForCausalLM(PreTrainedModel):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
 
+        loss = None
         if labels is not None:
+            # standard causal LM shift
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        else:
-            loss = None
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
 
         if not return_dict:
             out = (logits,) + outputs[1:]
             return ((loss,) + out) if loss is not None else out
 
-        from transformers.modeling_outputs import CausalLMOutputWithPast
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -1190,9 +1281,7 @@ class SlimLlamaForCausalLM(PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
-
+        
 class SlimLlamaSdpaAttention(nn.Module):
     def __init__(self, config: LlamaConfig, Hq: int):
         super().__init__()
@@ -1546,3 +1635,77 @@ def load_slim_for_finetune(
     slim.train()
 
     return slim
+
+
+
+def load_slim_llama(
+    slim_ckpt: Path,
+    base_id: str,
+    device: str = "cpu",
+) -> SlimLlamaForCausalLM:
+    """
+    Load a locally-trained slim LLaMA checkpoint and wrap it in SlimLlamaForCausalLM.
+
+    Expected formats for `torch.load(slim_ckpt)`:
+
+    1) dict with keys:
+         - "config"      (optional, LlamaConfig or dict)
+         - "layer_meta"  (list/dict with per-layer Hq, d_ff)
+         - "state_dict"  (actual model SD)
+
+    2) nn.Module (SlimLlamaForCausalLM or SlimLlamaModel wrapper)
+       -> we infer layer_meta from module and take its state_dict().
+    """
+    obj = torch.load(slim_ckpt, map_location=device, weights_only=False)
+
+    # Case 1: dict with metadata
+    if isinstance(obj, dict) and "layer_meta" in obj:
+        layer_meta = obj["layer_meta"]
+        if "state_dict" in obj:
+            sd = obj["state_dict"]
+        elif "model" in obj and isinstance(obj["model"], torch.nn.Module):
+            sd = obj["model"].state_dict()
+        else:
+            # assume it's already a state_dict
+            sd = obj
+    # Case 2: plain state_dict (no metadata in file)
+    elif isinstance(obj, dict):
+        raise ValueError(
+            f"Slim checkpoint {slim_ckpt} is a plain state_dict without `layer_meta`.\n"
+            "Please save your slim checkpoints as {'state_dict': ..., 'layer_meta': ...}."
+        )
+    # Case 3: nn.Module
+    elif isinstance(obj, torch.nn.Module):
+        raise ValueError(
+            f"Got a full nn.Module in {slim_ckpt}, but no explicit layer_meta.\n"
+            "For reproducible HF export, save as a dict with keys 'state_dict' and 'layer_meta'."
+        )
+    else:
+        raise TypeError(
+            f"Unexpected object type in slim_ckpt: {type(obj)}. "
+            "Expected dict with 'layer_meta' and 'state_dict'."
+        )
+
+    # Build config: either from file or from base HF model
+    if "config" in obj and isinstance(obj["config"], LlamaConfig):
+        cfg_slim = obj["config"]
+    elif "config" in obj and isinstance(obj["config"], dict):
+        cfg_slim = LlamaConfig.from_dict(obj["config"])
+    else:
+        cfg_slim = LlamaConfig.from_pretrained(base_id)
+
+    # Inject pruning metadata into config for HF
+    cfg_slim.layer_meta = layer_meta
+
+    # Optional: override architectures and auto_map to SlimLlamaForCausalLM
+    # NOTE: module path should match how you expose SlimLlamaForCausalLM in the HF repo
+    cfg_slim.architectures = ["SlimLlamaForCausalLM"]
+    cfg_slim.auto_map = {
+        "AutoModelForCausalLM": "slim_llama.SlimLlamaForCausalLM"
+    }
+
+    model = SlimLlamaForCausalLM(cfg_slim, layer_meta=layer_meta)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    print(f"[slim] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+
+    return model

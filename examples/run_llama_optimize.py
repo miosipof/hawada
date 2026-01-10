@@ -62,14 +62,14 @@ def save_json(obj, path: Path):
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
 
-def _pick_id(model_cfg: Dict[str, Any], fallback_key: str = "hf_id") -> str:
-    # Robust HF id retrieval (mirrors ViT pattern)
-    return (
-        model_cfg.get("student_name_or_path")
-        or model_cfg.get("name_or_path")
-        or model_cfg.get("name")
-        or model_cfg.get(fallback_key)
-    )
+# def _pick_id(model_cfg: Dict[str, Any], fallback_key: str = "hf_id") -> str:
+#     # Robust HF id retrieval (mirrors ViT pattern)
+#     return (
+#         model_cfg.get("student_name_or_path")
+#         or model_cfg.get("name_or_path")
+#         or model_cfg.get("name")
+#         or model_cfg.get(fallback_key)
+#     )
 
 # ------------------------
 # Batch extractors (dict/tuple/ids)
@@ -123,6 +123,125 @@ def build_argparser():
     return ap
 
 
+def build_from_recipe(recipe_path):
+
+    R = load_yaml(recipe_path)
+
+    student_id = R["model"]["name"]
+    teacher_id = R["base_model"]
+
+    # -------- build models --------
+    print(f"[load] teacher: {teacher_id}")
+    teacher = AutoModelForCausalLM.from_pretrained(teacher_id)
+    print(f"[load] student: {student_id}")
+    student = AutoModelForCausalLM.from_pretrained(student_id)
+
+    device = R.get("trainer", {}).get("device", "cuda")
+    
+    # kill attention & residual dropouts on the student
+    if hasattr(student, "config"):
+        if hasattr(student.config, "attention_dropout"):
+            student.config.attention_dropout = 0.0
+        if hasattr(student.config, "hidden_dropout_prob"):
+            student.config.hidden_dropout_prob = 0.0
+    for m in student.modules():
+        if hasattr(m, "attention_dropout"):
+            try: m.attention_dropout = 0.0
+            except: pass
+        if isinstance(m, torch.nn.Dropout):
+            m.p = 0.0
+            
+    if hasattr(student, "config"):
+        student.config.use_cache = False
+    try:
+        student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except Exception:
+        try: student.gradient_checkpointing_enable()
+        except: pass
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    teacher.eval().to(device)
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    data_cfg = R.get("data", {})
+    train_loader, val_loader, tok_s, tok_t, st_vocab_map = build_llm_dataloaders_from_cfg(data_cfg)
+
+    gating_cfg = R.get("gating", {})
+
+    tr_cfg = R.get("trainer", {})
+
+    # -------- latency proxy (bridge to generic interface) --------
+    lat_cfg = R.get("latency_proxy", {})
+    decode_T = int(lat_cfg.get("measure",{}).get("T", 128)) # Number of tokens for decoding
+    B = int(lat_cfg.get("measure",{}).get("B", 1)) # Batch size for measurements
+    S = int(lat_cfg.get("measure",{}).get("S", 1024))
+
+    llm_proxy = LatencyProxyLLM(gate_kv_in_proxy=bool(lat_cfg.get("gate_kv_in_proxy", False)))
+    proxy = _ProxyBridge(llm_proxy, decode_T=decode_T)
+
+    # -------- export policies --------
+    export_cfg = R.get("export", {})
+    # Eval policy used during training/probes (permissive)
+    policy_eval = LlamaExportPolicy(
+        warmup_steps=0,
+        head_rounding=CoreRounding(
+            floor_groups=1,
+            multiple_groups=1,
+            min_keep_ratio=0.5,
+        ),
+        q_rounding=CoreRounding(
+            floor_groups=1,
+            multiple_groups=1,
+            min_keep_ratio=0.5,
+        ),          
+        ffn_rounding=CoreRounding(
+            floor_groups=1,
+            multiple_groups=1,
+            min_keep_ratio=0.5,
+        ),
+    )
+
+    # Final export policy after training (stricter + kernel-friendly)
+    export_policy_final = LlamaExportPolicy(
+        warmup_steps=int(export_cfg.get("warmup_steps", 5)),
+        head_rounding=CoreRounding(
+            floor_groups=int(export_cfg.get("heads",{}).get("floor", 4)),
+            multiple_groups=int(export_cfg.get("heads",{}).get("multiple", 8)),
+            min_keep_ratio=float(export_cfg.get("heads",{}).get("min_keep_ratio", 0.5)),
+        ),
+        q_rounding=CoreRounding(
+            floor_groups=int(export_cfg.get("q",{}).get("floor", 4)),
+            multiple_groups=int(export_cfg.get("q",{}).get("multiple", 8)),
+            min_keep_ratio=float(export_cfg.get("q",{}).get("min_keep_ratio", 0.5)),
+        ),        
+        ffn_rounding=CoreRounding(
+            floor_groups=int(export_cfg.get("ffn",{}).get("floor", 1)),
+            multiple_groups=int(export_cfg.get("ffn",{}).get("multiple", 128)),
+            min_keep_ratio=float(export_cfg.get("ffn",{}).get("min_keep_ratio", 0.5)),
+        ),
+    )
+    
+    return {
+        "student": student,
+        "teacher": teacher,
+        "gating": gating_cfg,
+        "export_policy": export_policy_final,
+        "probe_policy": policy_eval,
+        "proxy": proxy,
+        "trainer_cfg": tr_cfg,
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "tok_s": tok_s, # Student's tokenizer
+        "tok_t": tok_t, # Teacher's tokenizer
+        "decode_T": decode_T,
+        "batch_size": B,   
+        "S": S,
+        "device": device,
+        "recipe": R,
+    }
+    
 # ------------------------
 # Main
 # ------------------------
@@ -138,115 +257,28 @@ def main():
     sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
 
 
-    cfg = load_yaml(args.recipe)
-    device = args.device
-
-    # -------- model ids / config --------
-    model_cfg = cfg.get("model", {})
-    student_id = _pick_id(model_cfg)  # student + teacher same by default
-    teacher_id = model_cfg.get("teacher_name_or_path") or student_id
-
-    # -------- data loaders --------
-    data_cfg = cfg.get("data", {})
-    train_loader, val_loader, tok_s, tok_t, st_vocab_map = build_llm_dataloaders_from_cfg(data_cfg)
-
     if args.slim is None:
-        # -------- build models --------
-        print(f"[load] teacher: {teacher_id}")
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_id)
-        print(f"[load] student: {student_id}")
-        student = AutoModelForCausalLM.from_pretrained(student_id)
-    
-        # kill attention & residual dropouts on the student
-        if hasattr(student, "config"):
-            if hasattr(student.config, "attention_dropout"):
-                student.config.attention_dropout = 0.0
-            if hasattr(student.config, "hidden_dropout_prob"):
-                student.config.hidden_dropout_prob = 0.0
-        for m in student.modules():
-            if hasattr(m, "attention_dropout"):
-                try: m.attention_dropout = 0.0
-                except: pass
-            if isinstance(m, torch.nn.Dropout):
-                m.p = 0.0
-                
-        if hasattr(student, "config"):
-            student.config.use_cache = False
-        try:
-            student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except Exception:
-            try: student.gradient_checkpointing_enable()
-            except: pass
-    
+
+
+        pack = build_from_recipe(args.recipe)
+
+        student = pack["student"] # LlaMa-3.2-1B
+        teacher = pack["teacher"] # Another instance of LlaMa-3.2-1B
         
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-        teacher.eval().to(device)
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-    
         # -------- attach gates to STUDENT via adapter --------
         adapter = LlamaAdapter(student)
         gate_cfg = LlamaGatingConfig(
             tau=float(model_cfg.get("gating", {}).get("tau", 1.5)),
-            init_logit=float(model_cfg.get("gating", {}).get("init_logit", 3.0)),
-            head_gating=bool(model_cfg.get("gating", {}).get("head_gating", True)),
-            gate_kv=bool(model_cfg.get("gating", {}).get("gate_kv", False)),
-            ffn_group=int(model_cfg.get("gating", {}).get("ffn_group", 128)),
-            ffn_gating=bool(model_cfg.get("gating", {}).get("ffn_gating", True)),
-            hard_eval=bool(model_cfg.get("gating", {}).get("hard_eval", True)),
+            init_logit=float(pack.get("gating", {}).get("init_logit", 3.0)),
+            head_gating=bool(pack.get("gating", {}).get("head_gating", True)),
+            gate_kv=bool(pack.get("gating", {}).get("gate_kv", False)),
+            ffn_group=int(pack.get("gating", {}).get("ffn_group", 128)),
+            ffn_gating=bool(pack.get("gating", {}).get("ffn_gating", True)),
+            hard_eval=bool(pack.get("gating", {}).get("hard_eval", True)),
         )
-        student = adapter.attach_gates(gate_cfg).train().to(device)
-    
-        # -------- latency proxy (bridge to generic interface) --------
-        lat_cfg = cfg.get("latency", {})
-        decode_T = int(lat_cfg.get("decode_T_tokens", 128))
-    
-        llm_proxy = LatencyProxyLLM(gate_kv_in_proxy=bool(lat_cfg.get("proxy_gate_kv", False)))
-        proxy = _ProxyBridge(llm_proxy, decode_T=decode_T)
-    
-        # -------- export policies --------
-        export_cfg = cfg.get("export", {})
-    
-        # Eval policy used during training/probes (permissive)
-        policy_eval = LlamaExportPolicy(
-            warmup_steps=0,
-            head_rounding=CoreRounding(
-                floor_groups=1,
-                multiple_groups=1,
-                min_keep_ratio=0.5,
-            ),
-            q_rounding=CoreRounding(
-                floor_groups=1,
-                multiple_groups=1,
-                min_keep_ratio=0.5,
-            ),          
-            ffn_rounding=CoreRounding(
-                floor_groups=1,
-                multiple_groups=1,
-                min_keep_ratio=0.5,
-            ),
-        )
-    
-        # Final export policy after training (stricter + kernel-friendly)
-        export_policy_final = LlamaExportPolicy(
-            warmup_steps=int(export_cfg.get("warmup_steps", 5)),
-            head_rounding=CoreRounding(
-                floor_groups=int(export_cfg.get("heads",{}).get("floor", 4)),
-                multiple_groups=int(export_cfg.get("heads",{}).get("multiple", 8)),
-                min_keep_ratio=float(export_cfg.get("heads",{}).get("min_keep_ratio", 0.5)),
-            ),
-            q_rounding=CoreRounding(
-                floor_groups=int(export_cfg.get("q",{}).get("floor", 4)),
-                multiple_groups=int(export_cfg.get("q",{}).get("multiple", 8)),
-                min_keep_ratio=float(export_cfg.get("q",{}).get("min_keep_ratio", 0.5)),
-            ),        
-            ffn_rounding=CoreRounding(
-                floor_groups=int(export_cfg.get("ffn",{}).get("floor", 1)),
-                multiple_groups=int(export_cfg.get("ffn",{}).get("multiple", 128)),
-                min_keep_ratio=float(export_cfg.get("ffn",{}).get("min_keep_ratio", 0.5)),
-            ),
-        )
+        student = adapter.attach_gates(gate_cfg).train().to(device)    
+
+        llm_proxy = pack["proxy"]
     
         # Proxy calibration
         batch = next(iter(train_loader))
