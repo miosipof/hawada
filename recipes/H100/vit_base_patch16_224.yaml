@@ -7,7 +7,7 @@ model:
   pretrained: true
   num_classes: 1000
 
-target_gpu: NVIDIA-RTX4090
+target_gpu: NVIDIA-H100
 
 latency:
   # target_ms: 28.0

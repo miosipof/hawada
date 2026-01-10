@@ -179,6 +179,8 @@ def build_from_recipe(recipe_path: str):
         "val_loader": val_loader,
         "get_s": get_s,
         "get_t": get_t,
+        "img_size": img_size,
+        "batch_size": B,        
         "device": device,
         "recipe": R,
     }

@@ -5,6 +5,8 @@ model:
   hf_id: meta-llama/Llama-3.2-1B
   adapter: huggingface.llama  # LlamaAdapter
 
+target_gpu: NVIDIA-RTX4090
+
 gating:
   tau: 1.5
   init_logit: 3.0
