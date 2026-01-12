@@ -206,6 +206,10 @@ class _TensorBackedGateShim:
         self.group_size = int(getattr(host, "group_size", getattr(host, "group", 1)))
         self.num_groups = int(self.logits.numel())
 
+    def probs(self) -> torch.Tensor:
+        """Match Gate.probs(): sigmoid(logits / tau)."""
+        return torch.sigmoid(self.logits / self.tau)
+        
     def forward(self, *args, **kwargs):  # pragma: no cover - shim is not used as a layer
         raise RuntimeError("Gate shim is not a callable layer")
 

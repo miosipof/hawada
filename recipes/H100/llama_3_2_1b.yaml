@@ -2,8 +2,12 @@
 # Save as: recipes/llama_3_2_1b.yaml
 
 model:
-  hf_id: meta-llama/Llama-3.2-1B
+  name: meta-llama/Llama-3.2-1B
   adapter: huggingface.llama  # LlamaAdapter
+
+base_model: meta-llama/Llama-3.2-1B
+
+target_gpu: NVIDIA-H100
 
 gating:
   tau: 1.5

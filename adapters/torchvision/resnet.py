@@ -9,7 +9,7 @@ It targets torchvision-style ResNets (resnet18/34/50/101) with BasicBlock/Bottle
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence, Tuple
 import copy
 
@@ -75,7 +75,7 @@ class ResNetExportPolicy:
     - `warmup_steps` keeps all channels when step < warmup_steps.
     """
     warmup_steps: int = 0
-    rounding: CoreRounding = CoreRounding(floor_groups=1, multiple_groups=1, min_keep_ratio=0.0)
+    rounding: CoreRounding = field(default_factory=lambda: CoreRounding(floor_groups=1, multiple_groups=1, min_keep_ratio=0.0))
     min_keep_ratio: float = 0.0
 
 

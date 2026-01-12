@@ -2,7 +2,7 @@
 """Post-pruning fine-tuning utilities (distillation)."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Iterable
 
 import torch
@@ -19,7 +19,7 @@ class FinetuneConfig:
     epochs: int = 5
     lr: float = 3e-4
     wd: float = 0.0
-    kd: KDConfig = KDConfig(temperature=2.0, alpha=1.0)
+    kd: KDConfig = field(default_factory=lambda: KDConfig(temperature=2.0, alpha=1.0))
     amp: bool = True
     # "auto" -> bf16 if supported else fp16; "bf16" | "fp16" | "off" also allowed
     amp_dtype: str = "auto"

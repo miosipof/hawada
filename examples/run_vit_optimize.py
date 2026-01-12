@@ -75,7 +75,7 @@ def build_from_recipe(recipe_path: str):
         R = yaml.safe_load(f)
 
     # --- Models
-    model_id = R["model"]
+    model_id = R["model"]["name"]
     base_model_id = R["base_model"]
     device = R.get("trainer", {}).get("device", "cuda")
 
@@ -145,8 +145,8 @@ def build_from_recipe(recipe_path: str):
     trcfg = TrainerConfig(
         latency_target_ms=latency_target_ms,  
         kd=kd_cfg,
-        penalties=TrainerConfig.penalties.__class__(**penalties),
-        constraints=TrainerConfig.constraints.__class__(**constraints),
+        # penalties=TrainerConfig.penalties.__class__(**penalties),
+        # constraints=TrainerConfig.constraints.__class__(**constraints),
         mse_weight=mse_weight,
         amp=bool(R.get("trainer", {}).get("amp", True)),
         real_probe_every=int(R.get("trainer", {}).get("lagrange", {}).get("real_every", 10)),        
@@ -179,6 +179,8 @@ def build_from_recipe(recipe_path: str):
         "val_loader": val_loader,
         "get_s": get_s,
         "get_t": get_t,
+        "img_size": img_size,
+        "batch_size": B,        
         "device": device,
         "recipe": R,
     }

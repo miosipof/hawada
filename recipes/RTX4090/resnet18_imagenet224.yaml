@@ -5,6 +5,8 @@ model:
   pretrained: true
   num_classes: 1000
 
+target_gpu: NVIDIA-RTX4090
+
 # BN gating config
 gates:
   group_size: 16

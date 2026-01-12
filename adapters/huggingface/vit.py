@@ -17,12 +17,19 @@ from __future__ import annotations
 import sys, pathlib
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from transformers import ViTConfig
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import ImageClassifierOutput
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.vit.modeling_vit import ViTEmbeddings
 
 # NOTE: absolute imports so running `-m examples.run_vit_optimize` works without package install
 from core.gates import HeadGate, GroupGate
@@ -336,8 +343,8 @@ class ViTAdapter:
 @dataclass
 class ViTExportPolicy:
     warmup_steps: int = 0
-    head_rounding: CoreRounding = CoreRounding()
-    ffn_rounding: CoreRounding = CoreRounding()
+    head_rounding: CoreRounding = field(default_factory=CoreRounding)
+    ffn_rounding:  CoreRounding = field(default_factory=CoreRounding)
 
 
 @dataclass
@@ -554,3 +561,294 @@ class ViTLatencyProxy(LatencyProxy):
         soft_ms = self.predict(model, sample_t).item()
         self.cfg.scale_ms = float(mean_ms / max(soft_ms, 1e-9))
         return self.cfg.scale_ms    
+
+
+
+@dataclass
+class SlimLayout:
+    """Per-layer structural info for a pruned ViT.
+
+    These are stored on the config so we can rebuild the exact shapes from a
+    state_dict without inspecting the checkpoint at construction time.
+    """
+    num_heads: List[int]
+    intermediate_sizes: List[int]
+    head_dim: int  # typically 64 for ViT-B/16
+
+
+# -----------------------------------------------------------------------------
+# Building blocks
+# -----------------------------------------------------------------------------
+
+class SlimViTSelfAttention(nn.Module):
+    """Self-attention where the number of heads can vary per-layer."""
+
+    def __init__(self, config: ViTConfig, layer_idx: int, layout: SlimLayout):
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+
+        self.num_attention_heads = int(layout.num_heads[layer_idx])
+        self.attention_head_size = int(layout.head_dim)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        if self.all_head_size <= 0:
+            raise ValueError(f"Invalid all_head_size at layer {layer_idx}: {self.all_head_size}")
+
+        self.query = nn.Linear(self.hidden_size, self.all_head_size, bias=True)
+        self.key   = nn.Linear(self.hidden_size, self.all_head_size, bias=True)
+        self.value = nn.Linear(self.hidden_size, self.all_head_size, bias=True)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+    def _shape(self, x: torch.Tensor, bsz: int, seq_len: int) -> torch.Tensor:
+        # [B, S, H*Dh] -> [B, H, S, Dh]
+        return (
+            x.view(bsz, seq_len, self.num_attention_heads, self.attention_head_size)
+             .permute(0, 2, 1, 3)
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, S, D]
+
+        Returns:
+            attention_output: [B, S, D]
+        """
+        bsz, seq_len, _ = hidden_states.size()
+
+        q = self._shape(self.query(hidden_states), bsz, seq_len)
+        k = self._shape(self.key(hidden_states),   bsz, seq_len)
+        v = self._shape(self.value(hidden_states), bsz, seq_len)
+
+        # scaled dot-product attention
+        attn_scores = torch.matmul(q, k.transpose(-1, -2))
+        attn_scores = attn_scores / (self.attention_head_size ** 0.5)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        attn_output = torch.matmul(attn_probs, v)  # [B, H, S, Dh]
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        attn_output = attn_output.view(bsz, seq_len, self.all_head_size)  # [B, S, H*Dh]
+
+        return attn_output
+
+
+class SlimViTAttention(nn.Module):
+    """Attention block: SelfAttention -> Linear + Dropout."""
+
+    def __init__(self, config: ViTConfig, layer_idx: int, layout: SlimLayout):
+        super().__init__()
+        self.attention = SlimViTSelfAttention(config, layer_idx, layout)
+
+        # Note: output projects from H*Dh back to D; FFN keeps D fixed as well.
+        self.output = nn.Module()
+        self.output.dense = nn.Linear(
+            layout.head_dim * layout.num_heads[layer_idx],
+            config.hidden_size,
+            bias=True,
+        )
+        self.output.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        attn_out = self.attention(hidden_states)          # [B, S, H*Dh]
+        attn_out = self.output.dense(attn_out)            # [B, S, D]
+        attn_out = self.output.dropout(attn_out)
+        return attn_out
+
+
+class SlimViTIntermediate(nn.Module):
+    """FFN first linear (D -> intermediate_size[layer])."""
+
+    def __init__(self, config: ViTConfig, layer_idx: int, layout: SlimLayout):
+        super().__init__()
+        dim = int(layout.intermediate_sizes[layer_idx])
+        self.dense = nn.Linear(config.hidden_size, dim)
+        self.intermediate_act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.intermediate_act_fn(self.dense(hidden_states))
+
+
+class SlimViTOutput(nn.Module):
+    """FFN second linear (intermediate_size[layer] -> D)."""
+
+    def __init__(self, config: ViTConfig, layer_idx: int, layout: SlimLayout):
+        super().__init__()
+        dim = int(layout.intermediate_sizes[layer_idx])
+        self.dense = nn.Linear(dim, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        return hidden_states
+
+
+class SlimViTLayer(nn.Module):
+    """Single transformer block with per-layer attention & FFN sizes."""
+
+    def __init__(self, config: ViTConfig, layer_idx: int, layout: SlimLayout):
+        super().__init__()
+        self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm_after  = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self.attention   = SlimViTAttention(config, layer_idx, layout)
+        self.intermediate = SlimViTIntermediate(config, layer_idx, layout)
+        self.output       = SlimViTOutput(config, layer_idx, layout)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Pre-LN → Attention → Residual
+        residual = hidden_states
+        hidden_states = self.layernorm_before(hidden_states)
+        hidden_states = self.attention(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # Pre-LN → MLP → Residual
+        residual = hidden_states
+        hidden_states = self.layernorm_after(hidden_states)
+        hidden_states = self.output(self.intermediate(hidden_states))
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class SlimViTEncoder(nn.Module):
+    """Stack of L SlimViTLayer blocks."""
+
+    def __init__(self, config: ViTConfig, layout: SlimLayout):
+        super().__init__()
+        if len(layout.num_heads) != config.num_hidden_layers:
+            raise ValueError(
+                f"slim_num_heads length {len(layout.num_heads)} "
+                f"!= num_hidden_layers {config.num_hidden_layers}"
+            )
+        if len(layout.intermediate_sizes) != config.num_hidden_layers:
+            raise ValueError(
+                f"slim_intermediate_sizes length {len(layout.intermediate_sizes)} "
+                f"!= num_hidden_layers {config.num_hidden_layers}"
+            )
+
+        self.layers = nn.ModuleList(
+            SlimViTLayer(config, i, layout) for i in range(config.num_hidden_layers)
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for blk in self.layers:
+            hidden_states = blk(hidden_states)
+        return hidden_states
+
+
+class SlimViTModel(nn.Module):
+    """Backbone: embeddings + encoder + final LayerNorm."""
+
+    def __init__(self, config: ViTConfig, layout: SlimLayout):
+        super().__init__()
+        self.config = config
+        self.embeddings = ViTEmbeddings(config)
+        self.encoder = SlimViTEncoder(config, layout)
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pixel_values: [B, C, H, W] preprocessed images
+
+        Returns:
+            last_hidden_state: [B, S, D]
+        """
+        x = self.embeddings(pixel_values)  # [B, S, D]
+        x = self.encoder(x)
+        x = self.layernorm(x)
+        return x
+
+
+# -----------------------------------------------------------------------------
+# Top-level classification model
+# -----------------------------------------------------------------------------
+
+class SlimViTForImageClassification(PreTrainedModel):
+    """
+    ViT-like classifier whose attention heads and FFN widths are pruned
+    (possibly differently) per layer.
+
+    Expected config extra fields:
+      - config.slim_num_heads: List[int], len = num_hidden_layers
+      - config.slim_intermediate_sizes: List[int], len = num_hidden_layers
+      - optional config.slim_head_dim: int (defaults to hidden_size // original_num_heads)
+    """
+
+    config_class = ViTConfig
+    base_model_prefix = "vit"
+
+    def __init__(self, config: ViTConfig):
+        super().__init__(config)
+
+        # Derive per-layer layout from config
+        slim_num_heads = getattr(config, "slim_num_heads", None)
+        slim_inter_sizes = getattr(config, "slim_intermediate_sizes", None)
+        if slim_num_heads is None or slim_inter_sizes is None:
+            raise ValueError(
+                "SlimViTForImageClassification expects `slim_num_heads` and "
+                "`slim_intermediate_sizes` to be present on the config."
+            )
+
+        # Head dim: use explicit slim_head_dim if present, otherwise fall back to
+        # original ViT head dim (hidden_size / num_attention_heads).
+        if hasattr(config, "slim_head_dim"):
+            head_dim = int(config.slim_head_dim)
+        else:
+            if config.hidden_size % config.num_attention_heads != 0:
+                raise ValueError(
+                    "Cannot infer head_dim: hidden_size must be divisible by "
+                    "num_attention_heads if `slim_head_dim` is not provided."
+                )
+            head_dim = config.hidden_size // config.num_attention_heads
+
+        layout = SlimLayout(
+            num_heads=list(map(int, slim_num_heads)),
+            intermediate_sizes=list(map(int, slim_inter_sizes)),
+            head_dim=int(head_dim),
+        )
+
+        self.num_labels = config.num_labels
+        self.config = config
+
+        self.vit = SlimViTModel(config, layout)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        # Initialize parameters the HF way (Xavier, etc.)
+        self.post_init()
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+        **kwargs,
+    ) -> ImageClassifierOutput:
+
+        # Backbone
+        last_hidden_state = self.vit(pixel_values)   # [B, S, D]
+        cls = last_hidden_state[:, 0]               # CLS token
+
+        logits = self.classifier(cls)
+
+        loss = None
+        if labels is not None:
+            if self.num_labels == 1:
+                loss = F.mse_loss(logits.view(-1), labels.view(-1))
+            else:
+                loss = F.cross_entropy(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            out = (logits, last_hidden_state)
+            return ((loss,) + out) if loss is not None else out
+
+        return ImageClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=None,
+            attentions=None,
+        )
+        

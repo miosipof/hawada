@@ -2,8 +2,12 @@
 # Save as: recipes/llama_3_2_1b.yaml
 
 model:
-  hf_id: meta-llama/Llama-3.2-1B
+  name: meta-llama/Llama-3.2-1B
   adapter: huggingface.llama  # LlamaAdapter
+
+base_model: meta-llama/Llama-3.2-1B
+
+target_gpu: NVIDIA-RTX4090
 
 gating:
   tau: 1.5
@@ -66,7 +70,7 @@ trainer:
 latency_proxy:
   type: LLM            # LatencyProxyLLM
   gate_kv_in_proxy: false
-  # Initial weights; you’ll calibrate scale_ms automatically
+  # Initial weights; we'll calibrate scale_ms automatically
   scale_ms: 1.0
   alpha_qkv: 1.0
   alpha_scores: 1.0
@@ -77,16 +81,6 @@ latency_proxy:
     S: 1024
     T: 128
 
-# gate_training:          # optional 2-pass “optimize for latency” stage
-#   tau_target_ms: 0.85   # latency budget for proxy constraint (example)
-#   step_warmup_for_proxy: 5
-#   real_latency_every: 20
-#   export_eval_policy:
-#     warmup_steps: 0
-#     q_head_floor_post: 4
-#     q_head_multiple_post: 8
-#     ffn_min_keep_ratio_post: 0.80
-#     ffn_snap_groups_post: 32
 
 export:
   warmup_steps: 200

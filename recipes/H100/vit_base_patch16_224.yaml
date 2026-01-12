@@ -1,9 +1,13 @@
 # Recipe: google/vit-base-patch16-224 → hardware-aware slim
 
 base_model: google/vit-base-patch16-224
-model: hawada/vit-base-patch16-224-in1k
 
-target_gpu: NVIDIA-RTX4090
+model:
+  name: hawada/vit-base-patch16-224-in1k
+  pretrained: true
+  num_classes: 1000
+
+target_gpu: NVIDIA-H100
 
 latency:
   # target_ms: 28.0

@@ -25,7 +25,7 @@ Core modules used:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 import gc
 
@@ -50,9 +50,10 @@ class DualConfig:
 
 @dataclass
 class TrainerConfig:
-    kd: KDConfig = KDConfig()
-    penalties: PenaltyWeights = PenaltyWeights(l0=0.0, keep_floor_ratio=0.0, bimodality=0.0)
-    constraints: Constraints = Constraints(min_keep_ratio=0.0, min_groups=1, max_groups_drop=None)
+    kd: KDConfig = field(default_factory=KDConfig)
+    dual: DualConfig = field(default_factory=DualConfig)
+    penalties: PenaltyWeights = field(default_factory=PenaltyWeights)
+    constraints: Constraints = field(default_factory=Constraints)
 
     latency_target_ms: float = 30.0
     real_probe_every: int = 0        # steps; 0 disables real probes
@@ -74,9 +75,6 @@ class TrainerConfig:
 
     # Mixed precision scaler
     use_grad_scaler: bool = True
-
-    # Dual update
-    dual: DualConfig = DualConfig()
 
 
 # -----------------------------------------------------------------------------
@@ -279,8 +277,8 @@ class LagrangeTrainer:
             torch.cuda.empty_cache()
             gc.collect()
 
-            if step > 100:
-                break
+            # if step > 100:
+            #     break
     
         print(f"Epoch loss {running / max(1, seen):.6f}")
         return self.lambda_
