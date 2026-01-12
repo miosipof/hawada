@@ -1,0 +1,302 @@
+{
+    "run": {
+      "cwd_hint": "/workspace/hawada",
+      "model": "resnet18",   
+      "hardware": "RTX4090",   
+      "command": "python -m examples.run_resnet_optimize --recipe recipes/resnet18_imagenet224.yaml --epochs 3 --outdir runs/resnet18 --finetune True",
+      "parsed_namespace": {
+        "recipe": "recipes/resnet18_imagenet224.yaml",
+        "epochs": 3,
+        "outdir": "runs/resnet18",
+        "slim": null,
+        "finetune": true
+      }
+    },
+    "gate_training": {
+      "epochs": 3,
+      "steps_per_epoch": 203,
+      "epochs_detail": [
+        {
+          "epoch": 1,
+          "steps_logged": [
+            {
+              "step": 50,
+              "step_total": 203,
+              "kl": 10.161507,
+              "mse": 6.841634,
+              "gate": 152.051895,
+              "proxy_ms": 56.891,
+              "real_mean_ms": 50.523,
+              "real_p95_ms": 50.599,
+              "lambda": 11.106556
+            },
+            {
+              "step": 100,
+              "step_total": 203,
+              "kl": 8.323188,
+              "mse": 5.191504,
+              "gate": 50.609612,
+              "proxy_ms": 46.684,
+              "real_mean_ms": 47.046,
+              "real_p95_ms": 47.113,
+              "lambda": 16.956124
+            },
+            {
+              "step": 150,
+              "step_total": 203,
+              "kl": 7.502485,
+              "mse": 5.137569,
+              "gate": 8.483926,
+              "proxy_ms": 42.019,
+              "real_mean_ms": 47.038,
+              "real_p95_ms": 47.091,
+              "lambda": 17.756857
+            },
+            {
+              "step": 200,
+              "step_total": 203,
+              "kl": 7.935142,
+              "mse": 5.064267,
+              "gate": 8.363554,
+              "proxy_ms": 41.903,
+              "real_mean_ms": 47.012,
+              "real_p95_ms": 47.103,
+              "lambda": 18.050972
+            }
+          ],
+          "epoch_loss": 0.116583
+        },
+        {
+          "epoch": 2,
+          "steps_logged": [
+            {
+              "step": 50,
+              "step_total": 203,
+              "kl": 6.035622,
+              "mse": 5.526917,
+              "gate": 9.136027,
+              "proxy_ms": 41.811,
+              "real_mean_ms": 47.031,
+              "real_p95_ms": 47.109,
+              "lambda": 18.17826
+            },
+            {
+              "step": 100,
+              "step_total": 203,
+              "kl": 6.901845,
+              "mse": 3.896956,
+              "gate": 6.507757,
+              "proxy_ms": 41.711,
+              "real_mean_ms": 47.017,
+              "real_p95_ms": 47.088,
+              "lambda": 18.36351
+            },
+            {
+              "step": 150,
+              "step_total": 203,
+              "kl": 5.870112,
+              "mse": 3.880672,
+              "gate": 6.444403,
+              "proxy_ms": 41.605,
+              "real_mean_ms": 47.075,
+              "real_p95_ms": 47.195,
+              "lambda": 18.516536
+            },
+            {
+              "step": 200,
+              "step_total": 203,
+              "kl": 7.147246,
+              "mse": 3.596353,
+              "gate": 5.99578,
+              "proxy_ms": 41.495,
+              "real_mean_ms": 47.175,
+              "real_p95_ms": 47.345,
+              "lambda": 18.620872
+            }
+          ],
+          "epoch_loss": 0.01392
+        },
+        {
+          "epoch": 3,
+          "steps_logged": [
+            {
+              "step": 50,
+              "step_total": 203,
+              "kl": 5.808027,
+              "mse": 3.689976,
+              "gate": 6.126264,
+              "proxy_ms": 41.373,
+              "real_mean_ms": 47.16,
+              "real_p95_ms": 47.274,
+              "lambda": 18.528943
+            },
+            {
+              "step": 100,
+              "step_total": 203,
+              "kl": 6.903901,
+              "mse": 3.818588,
+              "gate": 6.355777,
+              "proxy_ms": 41.259,
+              "real_mean_ms": 47.045,
+              "real_p95_ms": 47.176,
+              "lambda": 18.517242
+            },
+            {
+              "step": 150,
+              "step_total": 203,
+              "kl": 4.52036,
+              "mse": 2.203609,
+              "gate": 3.721421,
+              "proxy_ms": 41.145,
+              "real_mean_ms": 47.067,
+              "real_p95_ms": 47.187,
+              "lambda": 18.454179
+            },
+            {
+              "step": 200,
+              "step_total": 203,
+              "kl": 4.036235,
+              "mse": 2.373166,
+              "gate": 3.994874,
+              "proxy_ms": 41.034,
+              "real_mean_ms": 47.052,
+              "real_p95_ms": 47.224,
+              "lambda": 18.316706
+            }
+          ],
+          "epoch_loss": 0.010209
+        }
+      ],
+      "artifacts": {
+        "gated_model_path": "runs/resnet18/resnet18_gated.pth"
+      }
+    },
+    "export_grid_search": {
+      "status": "completed",
+      "search_space": {
+        "multiple_groups": [2, 3, 4, 5]
+      },
+      "progress_lines": [
+        {
+          "idx": 0,
+          "total": 4,
+          "params": { "multiple_groups": 2 },
+          "mean_ms": 47.026
+        },
+        {
+          "idx": 1,
+          "total": 4,
+          "params": { "multiple_groups": 3 },
+          "mean_ms": 47.061
+        },
+        {
+          "idx": 2,
+          "total": 4,
+          "params": { "multiple_groups": 4 },
+          "mean_ms": 47.179
+        },
+        {
+          "idx": 3,
+          "total": 4,
+          "params": { "multiple_groups": 5 },
+          "mean_ms": 47.219
+        }
+      ],
+      "best_export_params": { "multiple_groups": 2 },
+      "trials": [
+        {
+          "multiple_groups": 2,
+          "mean_ms": 47.0261555480957,
+          "p95_ms": 47.10468902587891
+        },
+        {
+          "multiple_groups": 3,
+          "mean_ms": 47.06145523071289,
+          "p95_ms": 47.15811710357666
+        },
+        {
+          "multiple_groups": 4,
+          "mean_ms": 47.178679885864256,
+          "p95_ms": 47.26891536712647
+        },
+        {
+          "multiple_groups": 5,
+          "mean_ms": 47.21884590148926,
+          "p95_ms": 47.37791442871094
+        }
+      ],
+      "post_steps": [
+        "Recalibrating BN stats on the slim model..."
+      ],
+      "artifacts": {
+        "slim_model_path": "runs/resnet18/resnet18_slim.pth"
+      }
+    },
+    "fine_tuning": {
+      "status": "started_and_completed",
+      "epochs": 30,
+      "config": {
+        "amp": { "mode": "OFF", "grad_scaler": "OFF" },
+        "kd": { "temperature_T": 4.0, "alpha": 2.0 },
+        "lr": 0.001,
+        "weight_decay": 0.00005,
+        "trainable_params": 7060920
+      },
+      "epoch_metrics": [
+        { "epoch": 1, "temperature_T": 3.93, "train_loss": 0.6581, "val_loss": 0.308717 },
+        { "epoch": 2, "temperature_T": 3.87, "train_loss": 0.551911, "val_loss": 0.28632 },
+        { "epoch": 3, "temperature_T": 3.8, "train_loss": 0.507136, "val_loss": 0.269553 },
+        { "epoch": 4, "temperature_T": 3.73, "train_loss": 0.470966, "val_loss": 0.251671 },
+        { "epoch": 5, "temperature_T": 3.67, "train_loss": 0.432993, "val_loss": 0.22997 },
+        { "epoch": 6, "temperature_T": 3.6, "train_loss": 0.395179, "val_loss": 0.212885 },
+        { "epoch": 7, "temperature_T": 3.53, "train_loss": 0.358592, "val_loss": 0.193309 },
+        { "epoch": 8, "temperature_T": 3.47, "train_loss": 0.327436, "val_loss": 0.18195 },
+        { "epoch": 9, "temperature_T": 3.4, "train_loss": 0.325389, "val_loss": 0.1775 },
+        { "epoch": 10, "temperature_T": 3.33, "train_loss": 0.288515, "val_loss": 0.167811 },
+        { "epoch": 11, "temperature_T": 3.27, "train_loss": 0.267404, "val_loss": 0.159125 },
+        { "epoch": 12, "temperature_T": 3.2, "train_loss": 0.251454, "val_loss": 0.155521 },
+        { "epoch": 13, "temperature_T": 3.13, "train_loss": 0.239333, "val_loss": 0.15302 },
+        { "epoch": 14, "temperature_T": 3.07, "train_loss": 0.2295, "val_loss": 0.150959 },
+        { "epoch": 15, "temperature_T": 3.0, "train_loss": 0.220966, "val_loss": 0.149718 },
+        { "epoch": 16, "temperature_T": 2.93, "train_loss": 0.214451, "val_loss": 0.150869 },
+        { "epoch": 17, "temperature_T": 2.87, "train_loss": 0.206474, "val_loss": 0.152425 },
+        { "epoch": 18, "temperature_T": 2.8, "train_loss": 0.247679, "val_loss": 0.17226 },
+        { "epoch": 19, "temperature_T": 2.73, "train_loss": 0.216253, "val_loss": 0.158841 },
+        { "epoch": 20, "temperature_T": 2.67, "train_loss": 0.202941, "val_loss": 0.157004 },
+        { "epoch": 21, "temperature_T": 2.6, "train_loss": 0.197472, "val_loss": 0.161379 },
+        { "epoch": 22, "temperature_T": 2.53, "train_loss": 0.213362, "val_loss": 0.171869 },
+        { "epoch": 23, "temperature_T": 2.47, "train_loss": 0.197378, "val_loss": 0.166102 },
+        { "epoch": 24, "temperature_T": 2.4, "train_loss": 0.188685, "val_loss": 0.16511 },
+        { "epoch": 25, "temperature_T": 2.33, "train_loss": 0.184263, "val_loss": 0.170099 },
+        { "epoch": 26, "temperature_T": 2.27, "train_loss": 0.181467, "val_loss": 0.171631 },
+        { "epoch": 27, "temperature_T": 2.2, "train_loss": 0.181379, "val_loss": 0.178417 },
+        { "epoch": 28, "temperature_T": 2.13, "train_loss": 0.180767, "val_loss": 0.181278 },
+        { "epoch": 29, "temperature_T": 2.07, "train_loss": 0.179935, "val_loss": 0.187169 },
+        { "epoch": 30, "temperature_T": 2.0, "train_loss": 0.182267, "val_loss": 0.196452 }
+      ],
+      "artifacts": {
+        "saved_pruned_model_path": "runs/resnet18/resnet18_slim.pth"
+      }
+    },
+    "benchmarking": {
+      "batch_size": 512,
+      "latency_ms": {
+        "base": { "mean_ms": 63.433, "p95_ms": 63.557 },
+        "slim": { "mean_ms": 47.157, "p95_ms": 47.309 }
+      },
+      "speedup_percent": 25.66
+    },
+    "agreement_eval": {
+      "command": "python -m tools.eval_agreement --model resnet --recipe recipes/resnet18_imagenet224.yaml --slim runs/resnet18/resnet18_slim.pth --batches 1000 --bs 512 --device cuda --T 1.0",
+      "temperature_T": 1.0,
+      "kl_at_T": 0.339232,
+      "top1_agreement": {
+        "agreement_percent": 77.05,
+        "num_samples": 26000,
+        "num_batches_measured": 102,
+        "batches_requested": 1000,
+        "batch_size": 512
+      }
+    }
+  }
+  

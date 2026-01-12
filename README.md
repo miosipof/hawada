@@ -4,6 +4,16 @@ __HawAda__ is an open-source universal framework for *hardware-aware optimizatio
 
 Inspired by hardware-aware pruning and efficiency methods [[1](https://openaccess.thecvf.com/content_ECCV_2018/papers/Tien-Ju_Yang_NetAdapt_Platform-Aware_Neural_ECCV_2018_paper.pdf), [2](https://arxiv.org/abs/1908.09791), [3](https://arxiv.org/abs/1807.11626), [4](https://arxiv.org/pdf/2110.10811) ], __HawAda__ provides a simple, user-friendly, and model-agnostic interface for optimizing neural networks with respect to real hardware latency, while preserving model quality.
 
+Speedup
+-------
+
+The speedup depends on the target latency and on the level of accuracy you want to reserve. The typical results for ResNet18 and ViT-base are:
+
+![Speedup overview](assets/speedup.png)
+
+
+
+
 High-level overview
 -------------------
 

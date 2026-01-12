@@ -1,0 +1,114 @@
+{
+    "run": {
+      "model": "vit_base_patch16_224",
+      "model_alias": "ViT-16-224",
+      "hardware": "H100"
+    },
+    "latency_proxy": {
+      "proxy_scale": 3.400837e-09,
+      "keep_all_latency_ms": 58.149,
+      "keep_all_batch_size": 64,
+      "target_fraction_of_keep_all": 0.6,
+      "target_latency_ms": 34.8894
+    },
+    "gate_training": {
+      "epochs": 10,
+      "epoch_losses": [
+        { "epoch": 1, "epoch_loss": 1.07051 },
+        { "epoch": 2, "epoch_loss": 1.220335 },
+        { "epoch": 3, "epoch_loss": 1.377763 },
+        { "epoch": 4, "epoch_loss": 1.543181 },
+        { "epoch": 5, "epoch_loss": 1.718382 },
+        { "epoch": 6, "epoch_loss": 1.886656 },
+        { "epoch": 7, "epoch_loss": 2.064904 },
+        { "epoch": 8, "epoch_loss": 2.231761 },
+        { "epoch": 9, "epoch_loss": 2.408321 },
+        { "epoch": 10, "epoch_loss": 2.581836 }
+      ]
+    },
+    "export_search": {
+      "status": "completed",
+      "reported_progress": {
+        "idx": 0,
+        "total": 11,
+        "params": { "head_multiple": 2, "ffn_snap": 1 },
+        "mean_ms": 48.07048217773438
+      },
+      "best_export_params": { "head_multiple": 2, "ffn_snap": 1 },
+      "best_trial": {
+        "head_multiple": 2,
+        "ffn_snap": 1,
+        "mean_ms": 48.07048217773438,
+        "p95_ms": 48.12677402496338
+      }
+    },
+    "benchmarking_pre_finetune": {
+      "latency_ms": {
+        "keep_all": { "mean_ms": 58.493, "p95_ms": 59.211 },
+        "slim": { "mean_ms": 48.127, "p95_ms": 48.621 }
+      },
+      "speedup_percent": 17.72
+    },
+    "artifacts": {
+      "slim_model_path": "runs/H100/vit_base/vit_slim.pth"
+    },
+    "fine_tuning": {
+      "epochs": 20,
+      "steps_per_epoch": 1625,
+      "config": {
+        "amp_mode": "BF16",
+        "grad_scaler": "OFF",
+        "kd": { "temperature_T": 4.0, "alpha": 2.0 },
+        "lr": 0.0001,
+        "weight_decay": 0.0,
+        "trainable_params": 73774756
+      },
+      "epoch_metrics": [
+        { "epoch": 1, "temperature_T": 3.9, "train_loss": 0.958661, "val_loss": 0.816333 },
+        { "epoch": 2, "temperature_T": 3.8, "train_loss": 0.659271, "val_loss": 0.768396 },
+        { "epoch": 3, "temperature_T": 3.7, "train_loss": 0.627042, "val_loss": 0.72575 },
+        { "epoch": 4, "temperature_T": 3.6, "train_loss": 0.60677, "val_loss": 0.781586 },
+        { "epoch": 5, "temperature_T": 3.5, "train_loss": 0.583796, "val_loss": 0.71348 },
+        { "epoch": 6, "temperature_T": 3.4, "train_loss": 0.561243, "val_loss": 0.770066 },
+        { "epoch": 7, "temperature_T": 3.3, "train_loss": 0.564647, "val_loss": 0.781676 },
+        { "epoch": 8, "temperature_T": 3.2, "train_loss": 0.546234, "val_loss": 0.801395 },
+        { "epoch": 9, "temperature_T": 3.1, "train_loss": 0.530505, "val_loss": 0.825912 },
+        { "epoch": 10, "temperature_T": 3.0, "train_loss": 0.512765, "val_loss": 0.791191 },
+        { "epoch": 11, "temperature_T": 2.9, "train_loss": 0.509423, "val_loss": 0.843942 },
+        { "epoch": 12, "temperature_T": 2.8, "train_loss": 0.494753, "val_loss": 0.840155 },
+        { "epoch": 13, "temperature_T": 2.7, "train_loss": 0.489255, "val_loss": 0.818471 },
+        { "epoch": 14, "temperature_T": 2.6, "train_loss": 0.460383, "val_loss": 0.740349 },
+        { "epoch": 15, "temperature_T": 2.5, "train_loss": 0.440528, "val_loss": 0.776837 },
+        { "epoch": 16, "temperature_T": 2.4, "train_loss": 0.42603, "val_loss": 0.801115 },
+        { "epoch": 17, "temperature_T": 2.3, "train_loss": 0.414744, "val_loss": 0.805435 },
+        { "epoch": 18, "temperature_T": 2.2, "train_loss": 0.395482, "val_loss": 0.74654 },
+        { "epoch": 19, "temperature_T": 2.1, "train_loss": 0.37436, "val_loss": 0.701321 },
+        { "epoch": 20, "temperature_T": 2.0, "train_loss": 0.359766, "val_loss": 0.702641 }
+      ]
+    },
+    "benchmarking_post_finetune": {
+      "batch_size": 64,
+      "latency_ms": {
+        "keep_all": { "mean_ms": 58.593, "p95_ms": 59.066 },
+        "slim": { "mean_ms": 48.218, "p95_ms": 48.745 }
+      },
+      "speedup_percent": 17.71
+    },
+    "agreement_eval": {
+      "command": "python -m tools.eval_agreement --model vit --recipe recipes/H100/vit_base_patch16_224.yaml --slim runs/H100/vit_base/vit_slim_finetune.pth --batches 1000 --bs 512 --device cuda --T 1.0",
+      "model_flag": "vit",
+      "recipe": "recipes/H100/vit_base_patch16_224.yaml",
+      "slim_path": "runs/H100/vit_base/vit_slim_finetune.pth",
+      "batches_requested": 1000,
+      "batch_size": 512,
+      "device": "cuda",
+      "temperature_T": 1.0,
+      "metrics": {
+        "kl_at_T": 0.418263,
+        "top1_agreement_percent": 84.13,
+        "num_samples": 26000,
+        "num_batches_measured": 813
+      }
+    }
+  }
+  

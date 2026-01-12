@@ -1,0 +1,225 @@
+{
+    "run": {
+      "cwd_hint": "/workspace/hawada",
+      "model": "resnet18",
+      "hardware": "H100",
+      "command": "python -m examples.run_resnet_optimize --recipe recipes/H100/resnet18_imagenet224.yaml --epochs 3 --outdir runs/resnet18 --finetune True",
+      "parsed_namespace": {
+        "recipe": "recipes/H100/resnet18_imagenet224.yaml",
+        "epochs": 3,
+        "outdir": "runs/resnet18",
+        "slim": null,
+        "finetune": true
+      }
+    },
+    "gate_training": {
+      "epochs": 3,
+      "steps_per_epoch_printed": 1,
+      "note": "Step counters show '/1' in the log lines (e.g., 'Step 50/1'); keeping as printed.",
+      "epochs_detail": [
+        {
+          "epoch": 1,
+          "steps_logged": [
+            {
+              "step": 50,
+              "step_total": 1,
+              "kl": 12.937542,
+              "mse": 5.81157,
+              "gate": 38.762096,
+              "proxy_ms": 24.397,
+              "real_ms": 22.646,
+              "real_p95_ms": 22.681,
+              "real_std_ms": 0.023,
+              "lambda": 5.24337
+            },
+            {
+              "step": 100,
+              "step_total": 1,
+              "kl": 9.951756,
+              "mse": 5.034592,
+              "gate": 18.868322,
+              "proxy_ms": 20.076,
+              "real_ms": 21.469,
+              "real_p95_ms": 21.517,
+              "real_std_ms": 0.026,
+              "lambda": 8.464905
+            }
+          ],
+          "epoch_loss": 0.061773
+        },
+        {
+          "epoch": 2,
+          "steps_logged": [
+            {
+              "step": 50,
+              "step_total": 1,
+              "kl": 10.022717,
+              "mse": 5.051219,
+              "gate": 8.365341,
+              "proxy_ms": 17.858,
+              "real_ms": 21.451,
+              "real_p95_ms": 21.472,
+              "real_std_ms": 0.015,
+              "lambda": 9.46989
+            },
+            {
+              "step": 100,
+              "step_total": 1,
+              "kl": 8.682142,
+              "mse": 5.589605,
+              "gate": 9.240046,
+              "proxy_ms": 17.777,
+              "real_ms": 21.455,
+              "real_p95_ms": 21.48,
+              "real_std_ms": 0.016,
+              "lambda": 10.24791
+            }
+          ],
+          "epoch_loss": 0.0175
+        },
+        {
+          "epoch": 3,
+          "steps_logged": [
+            {
+              "step": 50,
+              "step_total": 1,
+              "kl": 5.297691,
+              "mse": 3.148758,
+              "gate": 5.249681,
+              "proxy_ms": 17.704,
+              "real_ms": 21.459,
+              "real_p95_ms": 21.48,
+              "real_std_ms": 0.019,
+              "lambda": 10.907249
+            },
+            {
+              "step": 100,
+              "step_total": 1,
+              "kl": 7.492351,
+              "mse": 3.622271,
+              "gate": 6.023739,
+              "proxy_ms": 17.625,
+              "real_ms": 21.484,
+              "real_p95_ms": 21.532,
+              "real_std_ms": 0.036,
+              "lambda": 11.61797
+            }
+          ],
+          "epoch_loss": 0.013779
+        }
+      ],
+      "artifacts": {
+        "gated_model_path": "runs/resnet18/resnet18_gated.pth"
+      }
+    },
+    "export_grid_search": {
+      "status": "completed",
+      "search_space": {
+        "multiple_groups": [2, 3, 4, 5]
+      },
+      "progress_lines": [
+        { "idx": 0, "total": 4, "params": { "multiple_groups": 2 }, "mean_ms": 21.463 },
+        { "idx": 1, "total": 4, "params": { "multiple_groups": 3 }, "mean_ms": 21.45 },
+        { "idx": 2, "total": 4, "params": { "multiple_groups": 4 }, "mean_ms": 21.45 },
+        { "idx": 3, "total": 4, "params": { "multiple_groups": 5 }, "mean_ms": 21.455 }
+      ],
+      "best_export_params": { "multiple_groups": 4 },
+      "trials": [
+        {
+          "multiple_groups": 4,
+          "mean_ms": 21.449995460510255,
+          "p95_ms": 21.465685081481936
+        },
+        {
+          "multiple_groups": 3,
+          "mean_ms": 21.450256576538084,
+          "p95_ms": 21.46950159072876
+        },
+        {
+          "multiple_groups": 5,
+          "mean_ms": 21.45533248901367,
+          "p95_ms": 21.487873077392578
+        },
+        {
+          "multiple_groups": 2,
+          "mean_ms": 21.462705307006836,
+          "p95_ms": 21.5040452003479
+        }
+      ],
+      "post_steps": ["Recalibrating BN stats on the slim model..."],
+      "artifacts": {
+        "slim_model_path": "runs/resnet18/resnet18_slim.pth"
+      }
+    },
+    "fine_tuning": {
+      "epochs": 30,
+      "steps_per_epoch": 203,
+      "config": {
+        "amp": { "mode": "OFF", "grad_scaler": "OFF" },
+        "kd": { "temperature_T": 4.0, "alpha": 2.0 },
+        "lr": 0.001,
+        "weight_decay": 0.00005,
+        "trainable_params": 7060920
+      },
+      "epoch_metrics": [
+        { "epoch": 1, "temperature_T": 3.93, "train_loss": 0.648724, "val_loss": 0.564869 },
+        { "epoch": 2, "temperature_T": 3.87, "train_loss": 0.527291, "val_loss": 0.487266 },
+        { "epoch": 3, "temperature_T": 3.8, "train_loss": 0.462039, "val_loss": 0.42847 },
+        { "epoch": 4, "temperature_T": 3.73, "train_loss": 0.406027, "val_loss": 0.382297 },
+        { "epoch": 5, "temperature_T": 3.67, "train_loss": 0.361328, "val_loss": 0.340793 },
+        { "epoch": 6, "temperature_T": 3.6, "train_loss": 0.322104, "val_loss": 0.312183 },
+        { "epoch": 7, "temperature_T": 3.53, "train_loss": 0.293714, "val_loss": 0.287442 },
+        { "epoch": 8, "temperature_T": 3.47, "train_loss": 0.270742, "val_loss": 0.269809 },
+        { "epoch": 9, "temperature_T": 3.4, "train_loss": 0.251851, "val_loss": 0.255089 },
+        { "epoch": 10, "temperature_T": 3.33, "train_loss": 0.238734, "val_loss": 0.246944 },
+        { "epoch": 11, "temperature_T": 3.27, "train_loss": 0.229818, "val_loss": 0.235166 },
+        { "epoch": 12, "temperature_T": 3.2, "train_loss": 0.217609, "val_loss": 0.230188 },
+        { "epoch": 13, "temperature_T": 3.13, "train_loss": 0.209308, "val_loss": 0.222776 },
+        { "epoch": 14, "temperature_T": 3.07, "train_loss": 0.202394, "val_loss": 0.21625 },
+        { "epoch": 15, "temperature_T": 3.0, "train_loss": 0.197954, "val_loss": 0.22412 },
+        { "epoch": 16, "temperature_T": 2.93, "train_loss": 0.207094, "val_loss": 0.212691 },
+        { "epoch": 17, "temperature_T": 2.87, "train_loss": 0.187959, "val_loss": 0.209593 },
+        { "epoch": 18, "temperature_T": 2.8, "train_loss": 0.180888, "val_loss": 0.201176 },
+        { "epoch": 19, "temperature_T": 2.73, "train_loss": 0.176379, "val_loss": 0.200447 },
+        { "epoch": 20, "temperature_T": 2.67, "train_loss": 0.17285, "val_loss": 0.197873 },
+        { "epoch": 21, "temperature_T": 2.6, "train_loss": 0.169252, "val_loss": 0.198818 },
+        { "epoch": 22, "temperature_T": 2.53, "train_loss": 0.166519, "val_loss": 0.196226 },
+        { "epoch": 23, "temperature_T": 2.47, "train_loss": 0.164091, "val_loss": 0.196399 },
+        { "epoch": 24, "temperature_T": 2.4, "train_loss": 0.162949, "val_loss": 0.195153 },
+        { "epoch": 25, "temperature_T": 2.33, "train_loss": 0.161334, "val_loss": 0.195445 },
+        { "epoch": 26, "temperature_T": 2.27, "train_loss": 0.161708, "val_loss": 0.198516 },
+        { "epoch": 27, "temperature_T": 2.2, "train_loss": 0.17054, "val_loss": 0.204128 },
+        { "epoch": 28, "temperature_T": 2.13, "train_loss": 0.163863, "val_loss": 0.205428 },
+        { "epoch": 29, "temperature_T": 2.07, "train_loss": 0.160942, "val_loss": 0.206033 },
+        { "epoch": 30, "temperature_T": 2.0, "train_loss": 0.162719, "val_loss": 0.212566 }
+      ],
+      "artifacts": {
+        "saved_pruned_model_path": "runs/resnet18/resnet18_slim.pth"
+      }
+    },
+    "benchmarking": {
+      "batch_size": 512,
+      "latency_ms": {
+        "base": { "mean_ms": 26.899, "p95_ms": 26.941 },
+        "slim": { "mean_ms": 21.483, "p95_ms": 21.517 }
+      },
+      "speedup_percent": 20.13
+    },
+    "agreement_eval": {
+      "command": "python -m tools.eval_agreement --model resnet --recipe recipes/H100/resnet18_imagenet224.yaml --slim runs/H100/resnet18/resnet18_slim.pth --batches 1000 --bs 512 --device cuda --T 1.0",
+      "model_flag": "resnet",
+      "recipe": "recipes/H100/resnet18_imagenet224.yaml",
+      "slim_path": "runs/H100/resnet18/resnet18_slim.pth",
+      "batches_requested": 1000,
+      "batch_size": 512,
+      "device": "cuda",
+      "temperature_T": 1.0,
+      "metrics": {
+        "kl_at_T": 0.304366,
+        "top1_agreement_percent": 78.79,
+        "num_samples": 26000,
+        "num_batches_measured": 102
+      }
+    }
+  }
+  
