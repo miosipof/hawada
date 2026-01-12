@@ -64,57 +64,66 @@ The HawAda repository is organized around a modular, model-agnostic hardware-awa
 
 ```
 hawada/
-├── core/                   # Core training and optimization logic
-│   ├── train.py            # Lagrangian trainer, optimization loop
-│   ├── penalties.py        # Regularization and structured penalties
-│   ├── latency.py          # Latency proxy models and calibration
-│   └── losses.py           # KL, MSE, and auxiliary losses
+├── .gitignore
+├── README.md
+├── __init__.py
+├── requirements.txt
 │
-├── adapters/               # HawAda adapters and gating modules
-│   ├── base.py             # Abstract adapter interfaces
-│   ├── gates.py            # Trainable sigmoid gates
-│   └── attach.py           # Utilities to inject adapters into models
+├── adapters/
+│   ├── __init__.py
+│   ├── huggingface/
+│   │   ├── __init__.py
+│   │   ├── llama.py
+│   │   └── vit.py
+│   └── torchvision/
+│       └── resnet.py
 │
-├── models/                 # Model-specific integration
-│   ├── resnet/             # ResNet adapters and export logic
-│   ├── vit/                # Vision Transformer support
-│   └── llama/              # LLaMA adapters, head slimming, export
+├── core/
+│   ├── __init__.py
+│   ├── distill.py
+│   ├── export.py
+│   ├── finetune.py
+│   ├── gates.py
+│   ├── profiler.py
+│   ├── proxy_cost.py
+│   ├── search_export.py
+│   ├── train.py
+│   └── utils.py
 │
-├── export/                 # Pruning and slim model export
-│   ├── prune.py            # Gate-based pruning logic
-│   ├── search.py           # GPU-aware architecture search
-│   └── hf_export.py        # Hugging Face–compatible export
+├── data/
+│   ├── __init__.py
+│   ├── llms.py
+│   └── vision.py
 │
-├── proxy/                  # Hardware latency proxy models
-│   ├── base.py             # Proxy interface
-│   ├── trt.py              # TensorRT-based proxies
-│   └── torch.py            # PyTorch runtime proxies
+├── examples/
+│   ├── __init__.py
+│   ├── run_llama_optimize.py
+│   ├── run_resnet_optimize.py
+│   └── run_vit_optimize.py
 │
-├── benchmarks/             # Hardware measurement utilities
-│   ├── measure.py          # Real GPU latency measurement
-│   └── configs/            # GPU-specific benchmark configs
+├── notebooks/
+│   ├── llama.ipynb
+│   ├── resnet.ipynb
+│   ├── vit.ipynb
+│   └── utils/
+│       ├── ViT_pretraining.ipynb
+│       └── imagenet224.ipynb
 │
-├── configs/                # Training and optimization configs
-│   ├── resnet18_rtx4090.yaml
-│   ├── vit_base_rtx4090.yaml
-│   └── llama32_1b_h100.yaml
+├── recipes/
+│   ├── H100/
+│   │   ├── llama_3_2_1b.yaml
+│   │   ├── resnet18_imagenet224.yaml
+│   │   └── vit_base_patch16_224.yaml
+│   └── RTX4090/
+│       ├── llama_3_2_1b.yaml
+│       ├── resnet18_imagenet224.yaml
+│       └── vit_base_patch16_224.yaml
 │
-├── scripts/                # End-to-end runnable scripts
-│   ├── train.py            # Launch HawAda optimization
-│   ├── export.py           # Export slim model
-│   └── benchmark.py        # Measure final latency
-│
-├── examples/               # Minimal working examples
-│   ├── resnet18/
-│   ├── vit_base/
-│   └── llama/
-│
-├── utils/                  # Shared utilities
-│   ├── logging.py
-│   ├── checkpointing.py
-│   └── distributed.py
-│
-└── README.md
+└── tools/
+    ├── eval_agreement.py
+    ├── eval_llama_slim.py
+    ├── export_to_hf.py
+    └── print_shapes.py
 ```
 
 Design principles
