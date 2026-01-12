@@ -41,10 +41,20 @@ Current support
 HawAda currently includes reference implementations for:
 
 *   **ResNet-18** optimized for **RTX 4090**
-    
+    * [Gated model](https://huggingface.co/hawada/resnet18-rtx4090-gated)
+    * [Slim model](https://huggingface.co/hawada/resnet18-rtx4090-slim)
+
 *   **ViT-Base** optimized for **RTX 4090**
-    
+    * [Gated model](https://huggingface.co/hawada/vit-base-patch16-224-rtx4090-gated)
+    * [Slim model](https://huggingface.co/hawada/vit-base-patch16-224-rtx4090-slim)
+
 *   **LLaMA-3.2-1B** optimized for **RTX 4090** and **H100**
+    * RTX4090
+        * [Gated model](https://huggingface.co/hawada/Llama-3.2-1B-rtx4090-gated)
+        * [Slim model](https://huggingface.co/hawada/Llama-3.2-1B-rtx4090-slim-2)
+    * H100
+        * [Gated model](https://huggingface.co/hawada/Llama-3.2-1B-h100-gated)
+        * [Slim model](https://huggingface.co/hawada/Llama-3.2-1B-h100-slim-2)
 
 Notebooks
 ---------
