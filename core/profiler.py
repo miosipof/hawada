@@ -114,8 +114,10 @@ def measure_latency_ms(
     """
     cfg = settings or ProfileSettings()
 
+    device = str(model.device)
+
     with _torch_backend_ctx(cfg):
-        m = model.to(device).eval()
+        m = model.eval()
         if isinstance(sample, torch.Tensor):
             x = sample.to(device)
         else:
@@ -184,7 +186,7 @@ def profile(
     cfg = settings or ProfileSettings()
     mean_ms, _ = measure_latency_ms(model, sample, settings=cfg, device=device, forward_fn=forward_fn)
     # Re-run percentile calc on same settings for consistency
-    m = model.to(device).eval()
+    m = model.eval()
     if isinstance(sample, torch.Tensor):
         x = sample.to(device)
     else:
@@ -270,7 +272,8 @@ def measure_latency_text_ms(
       * Assumes Hugging Face-style causal LM forward signature returning `logits` and `past_key_values`.
     """
     # --------- prepare model & vocab size ----------
-    m = copy.deepcopy(model).to(device).eval()
+    device = str(model.device)
+    m = model.eval()
 
     if vocab_size is None:
         emb = m.get_input_embeddings() if hasattr(m, "get_input_embeddings") else None
