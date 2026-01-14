@@ -653,7 +653,7 @@ class LlamaAdapter:
                 if hasattr(new_attn, "head_dim"):
                     new_attn.head_dim = int(Dh)
                 if hasattr(new_attn, "num_key_value_groups"):
-                    new_attn.num_key_value_groups = new_attn.num_heads // new_attn.num_key_value_heads
+                    new_attn.num_key_value_groups = max(1, int(H_keep) // int(Hkv))
     
                 # plug back
                 layer.self_attn = new_attn
